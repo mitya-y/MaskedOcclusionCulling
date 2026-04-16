@@ -6,6 +6,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cfloat>
 #include <cstdlib>
@@ -722,6 +723,7 @@ int main(int argc, char **argv) {
 		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
 		moc->SetResolution((unsigned)kFbW, (unsigned)kFbH);
 		moc->SetNearClipPlane(fps.cam().projection().distance);
+		const auto tMocBuffer0 = std::chrono::steady_clock::now();
 		moc->ClearBuffer();
 
 		std::vector<size_t> order(objects.size());
@@ -777,6 +779,9 @@ int main(int argc, char **argv) {
 			    MaskedOcclusionCulling::CLIP_PLANE_ALL,
 			    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
 		}
+		const auto tMocBuffer1 = std::chrono::steady_clock::now();
+		const double mocBufferMs =
+		    std::chrono::duration<double, std::milli>(tMocBuffer1 - tMocBuffer0).count();
 
 		const unsigned nAll = (unsigned)objects.size();
 		unsigned nFrustum = 0;
@@ -803,6 +808,7 @@ int main(int argc, char **argv) {
 				++nFrustum;
 		}
 
+		const auto tMocQuery0 = std::chrono::steady_clock::now();
 		for (size_t i = 0; i < objects.size(); ++i) {
 			if (!frustumHit[i])
 				continue;
@@ -834,6 +840,9 @@ int main(int argc, char **argv) {
 				++nMocVisible;
 			}
 		}
+		const auto tMocQuery1 = std::chrono::steady_clock::now();
+		const double mocQueryMs =
+		    std::chrono::duration<double, std::milli>(tMocQuery1 - tMocQuery0).count();
 
 		glViewport(0, 0, kFbW, kFbH);
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -946,14 +955,22 @@ int main(int argc, char **argv) {
 			printf("2) AABB in frustum:          %u\n", nFrustum);
 			printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", nMocVisible);
 			printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", nGpuVisible);
+			printf(
+			    "5) MOC hierarchical-Z build (clear + sort + RenderTriangles): %.3f ms\n",
+			    mocBufferMs);
+			printf(
+			    "6) MOC occlusion queries (TransformVertices + TestTriangles): %.3f ms\n",
+			    mocQueryMs);
 			printf("--- errors (frustum subset only) ---\n");
 			printf("False positives (MOC visible, GPU no pixel): %u\n", fp);
 			printf("False negatives (MOC occluded/culled, GPU pixel): %u\n", fn);
 			printf("(Conservative culling should avoid false negatives; a non-zero count means mismatch.)\n");
 			fflush(stdout);
 		} else {
-			std::fprintf(stderr, "\rACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u\033[K", nAll,
-			    nFrustum, nMocVisible, nGpuVisible);
+			std::fprintf(stderr,
+			    "\rACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
+			    "5)mocBuf=%.3fms  6)mocQry=%.3fms\033[K",
+			    nAll, nFrustum, nMocVisible, nGpuVisible, mocBufferMs, mocQueryMs);
 			std::fflush(stderr);
 		}
 
@@ -967,7 +984,8 @@ int main(int argc, char **argv) {
 	if (!headless) {
 		printf("\nInteractive preview: WASD + Space/Z, Shift sprint, mouse look, scroll = move speed; "
 		       "P = print pose; 1–6,0 = scene camera presets.\n");
-		printf("Live stats on stderr: 1)–4) counts refresh every frame (full MOC+GPU readback pass).\n");
+		printf("Live stats on stderr: 1)–4) counts + 5)–6) MOC buffer / query CPU time (ms), every frame "
+		       "(full MOC+GPU readback pass).\n");
 		printf("Close the window to quit.\n");
 		fflush(stdout);
 	}
