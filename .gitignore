@@ -2,4 +2,4 @@ build/*
 Example/build/*
 FillrateTest/build/*
 AccuracyBench/build/*
-
+assets/*
