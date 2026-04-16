@@ -67,11 +67,21 @@ endif()
 # Setup compiler flags for AVX2 files
 #
 SET_SOURCE_FILES_PROPERTIES( ${MOC_AVX2_FILES} PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -msse4.1" )
+# GCC (e.g. 15.x): RasterizeTriangleBatch in SIMD TUs can crash at -O2/-O3; cap like MaskedOcclusionCulling.cpp.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+	set_source_files_properties(${MOC_AVX512_FILES} PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>$<$<CONFIG:RelWithDebInfo>:-O1>")
+	set_source_files_properties(${MOC_AVX2_FILES} PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>$<$<CONFIG:RelWithDebInfo>:-O1>")
+endif()
 
 #
 # Setup compiler flags for SSE4.1 / SSE2 files
 #
 SET_SOURCE_FILES_PROPERTIES( ${MOC_SSE_FILES} PROPERTIES COMPILE_FLAGS "-msse4.1" )
+# SSE4.1/SSE2 raster path lives in MaskedOcclusionCulling.cpp. GCC (e.g. 15.x) can still miscompile
+# RasterizeTriangleBatch at -O2/-O3 (intermittent segfaults in AccuracyBench). -O1 has been stable here.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+	set_source_files_properties(MaskedOcclusionCulling.cpp PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>$<$<CONFIG:RelWithDebInfo>:-O1>")
+endif()
 
 endif()
 

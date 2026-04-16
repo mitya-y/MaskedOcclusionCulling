@@ -14,6 +14,7 @@
 // under the License.
 ////////////////////////////////////////////////////////////////////////////////
 #include <vector>
+#include <cstdint>
 #include <string.h>
 #include <assert.h>
 #include <float.h>
@@ -32,55 +33,65 @@
 	#error The MaskedOcclusionCulling.cpp should be compiled with lowest supported target platform, e.g. /arch:SSE2
 #endif
 
-static MaskedOcclusionCulling::Implementation DetectCPUFeatures(MaskedOcclusionCulling::pfnAlignedAlloc alignedAlloc, MaskedOcclusionCulling::pfnAlignedFree alignedFree)
+static MaskedOcclusionCulling::Implementation DetectCPUFeatures(MaskedOcclusionCulling::pfnAlignedAlloc, MaskedOcclusionCulling::pfnAlignedFree)
 {
 	struct CpuInfo { int regs[4]; };
 
-	// Get regular CPUID values
+	// Scratch CPUID tables: use std::vector only (never mix with moc_aligned_*). Mis-sized buffers here
+	// caused heap corruption / "double free" on some machines when paired with custom allocators.
 	int regs[4];
 	__cpuidex(regs, 0, 0);
+	uint32_t nLeaf = (uint32_t)regs[0];
+	size_t nStd = (size_t)nLeaf;
+	if (nStd == 0)
+		nStd = 1;
+	// Cap: feature checks only need leaves through ~16; avoids huge vectors on odd hypervisors.
+	const size_t kMaxStd = 64;
+	if (nStd > kMaxStd)
+		nStd = kMaxStd;
 
-    //  MOCVectorAllocator<CpuInfo> mocalloc( alignedAlloc, alignedFree );
-    //  std::vector<CpuInfo, MOCVectorAllocator<CpuInfo>> cpuId( mocalloc ), cpuIdEx( mocalloc );
-    //  cpuId.resize( regs[0] );
-    size_t cpuIdCount = regs[0];
-    CpuInfo * cpuId = (CpuInfo*)alignedAlloc( 64, sizeof(CpuInfo) * cpuIdCount );
-    
-	for (size_t i = 0; i < cpuIdCount; ++i)
+	std::vector<CpuInfo> cpuId(nStd);
+	for (size_t i = 0; i < nStd; ++i)
 		__cpuidex(cpuId[i].regs, (int)i, 0);
 
-	// Get extended CPUID values
 	__cpuidex(regs, 0x80000000, 0);
+	uint32_t maxExtLeaf = (uint32_t)regs[0];
+	size_t nExt = 0;
+	if (maxExtLeaf >= 0x80000000u) {
+		nExt = (size_t)maxExtLeaf - 0x80000000u + 1u;
+		const size_t kMaxExt = 64;
+		if (nExt > kMaxExt)
+			nExt = kMaxExt;
+	}
 
-    //cpuIdEx.resize(regs[0] - 0x80000000);
-    size_t cpuIdExCount = regs[0] - 0x80000000;
-    CpuInfo * cpuIdEx = (CpuInfo*)alignedAlloc( 64, sizeof( CpuInfo ) * cpuIdExCount );
+	std::vector<CpuInfo> cpuIdEx;
+	if (nExt > 0) {
+		cpuIdEx.resize(nExt);
+		for (size_t i = 0; i < nExt; ++i)
+			__cpuidex(cpuIdEx[i].regs, 0x80000000 + (int)i, 0);
+	}
 
-    for (size_t i = 0; i < cpuIdExCount; ++i)
-		__cpuidex(cpuIdEx[i].regs, 0x80000000 + (int)i, 0);
+	const size_t cpuIdCount = cpuId.size();
+	const size_t cpuIdExCount = cpuIdEx.size();
 
 	#define TEST_BITS(A, B)            (((A) & (B)) == (B))
-	#define TEST_FMA_MOVE_OXSAVE       (cpuIdCount >= 1 && TEST_BITS(cpuId[1].regs[2], (1 << 12) | (1 << 22) | (1 << 27)))
-	#define TEST_LZCNT                 (cpuIdExCount >= 1 && TEST_BITS(cpuIdEx[1].regs[2], 0x20))
-	#define TEST_SSE41                 (cpuIdCount >= 1 && TEST_BITS(cpuId[1].regs[2], (1 << 19)))
-	#define TEST_XMM_YMM               (cpuIdCount >= 1 && TEST_BITS(moc_xgetbv(0), (1 << 2) | (1 << 1)))
-	#define TEST_OPMASK_ZMM            (cpuIdCount >= 1 && TEST_BITS(moc_xgetbv(0), (1 << 7) | (1 << 6) | (1 << 5)))
-	#define TEST_BMI1_BMI2_AVX2        (cpuIdCount >= 7 && TEST_BITS(cpuId[7].regs[1], (1 << 3) | (1 << 5) | (1 << 8)))
-	#define TEST_AVX512_F_BW_DQ        (cpuIdCount >= 7 && TEST_BITS(cpuId[7].regs[1], (1 << 16) | (1 << 17) | (1 << 30)))
+	#define TEST_FMA_MOVE_OXSAVE       (cpuIdCount > 1 && TEST_BITS(cpuId[1].regs[2], (1 << 12) | (1 << 22) | (1 << 27)))
+	#define TEST_LZCNT                 (cpuIdExCount > 1 && TEST_BITS(cpuIdEx[1].regs[2], 0x20))
+	#define TEST_SSE41                 (cpuIdCount > 1 && TEST_BITS(cpuId[1].regs[2], (1 << 19)))
+	#define TEST_XMM_YMM               (cpuIdCount > 1 && TEST_BITS(moc_xgetbv(0), (1 << 2) | (1 << 1)))
+	#define TEST_OPMASK_ZMM            (cpuIdCount > 1 && TEST_BITS(moc_xgetbv(0), (1 << 7) | (1 << 6) | (1 << 5)))
+	#define TEST_BMI1_BMI2_AVX2        (cpuIdCount > 7 && TEST_BITS(cpuId[7].regs[1], (1 << 3) | (1 << 5) | (1 << 8)))
+	#define TEST_AVX512_F_BW_DQ        (cpuIdCount > 7 && TEST_BITS(cpuId[7].regs[1], (1 << 16) | (1 << 17) | (1 << 30)))
 
-    MaskedOcclusionCulling::Implementation retVal = MaskedOcclusionCulling::SSE2;
-	if (TEST_FMA_MOVE_OXSAVE && TEST_LZCNT && TEST_SSE41)
-	{
+	MaskedOcclusionCulling::Implementation retVal = MaskedOcclusionCulling::SSE2;
+	if (TEST_FMA_MOVE_OXSAVE && TEST_LZCNT && TEST_SSE41) {
 		if (TEST_XMM_YMM && TEST_OPMASK_ZMM && TEST_BMI1_BMI2_AVX2 && TEST_AVX512_F_BW_DQ)
 			retVal = MaskedOcclusionCulling::AVX512;
 		else if (TEST_XMM_YMM && TEST_BMI1_BMI2_AVX2)
 			retVal = MaskedOcclusionCulling::AVX2;
-	} 
-    else if (TEST_SSE41)
+	} else if (TEST_SSE41)
 		retVal = MaskedOcclusionCulling::SSE41;
-    alignedFree( cpuId );
-    alignedFree( cpuIdEx );
-    return retVal;
+	return retVal;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -423,7 +434,7 @@ namespace MaskedOcclusionCullingAVX2
 
 MaskedOcclusionCulling *MaskedOcclusionCulling::Create(Implementation RequestedSIMD)
 {
-	return Create(RequestedSIMD, aligned_alloc, aligned_free);
+	return Create(RequestedSIMD, moc_aligned_alloc, moc_aligned_free);
 }
 
 MaskedOcclusionCulling *MaskedOcclusionCulling::Create(Implementation RequestedSIMD, pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree)

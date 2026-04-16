@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdio>
 #include <cstddef>
 #include <cstdlib>
@@ -426,6 +427,27 @@ static float DepthKey(const Vec3f &worldCenter, const Vec3f &camPos) {
 	return (worldCenter - camPos).length();
 }
 
+static bool MeshIsDrawable(const Mesh &m) {
+	return !m.positions.empty() && m.indices.size() >= 3 && (m.indices.size() % 3) == 0;
+}
+
+// Default caps at SSE4.1: avoids fragile AVX2 raster paths with some GCC/toolchain combos.
+// Override: ACCURACYBENCH_MOC_IMPL=AVX2|AVX512|SSE41|SSE2
+static MaskedOcclusionCulling::Implementation MocImplFromEnv() {
+	const char *e = std::getenv("ACCURACYBENCH_MOC_IMPL");
+	if (!e)
+		return MaskedOcclusionCulling::SSE41;
+	if (!std::strcmp(e, "AVX512"))
+		return MaskedOcclusionCulling::AVX512;
+	if (!std::strcmp(e, "AVX2"))
+		return MaskedOcclusionCulling::AVX2;
+	if (!std::strcmp(e, "SSE41"))
+		return MaskedOcclusionCulling::SSE41;
+	if (!std::strcmp(e, "SSE2"))
+		return MaskedOcclusionCulling::SSE2;
+	return MaskedOcclusionCulling::SSE41;
+}
+
 static const char *MocResultStr(MaskedOcclusionCulling::CullingResult r) {
 	switch (r) {
 	case MaskedOcclusionCulling::VISIBLE:
@@ -447,6 +469,9 @@ static bool ParseCameraSpec(const char *s, Vec3f &outPos, Vec3f &outDir, Vec3f &
 		n = std::sscanf(s, "((%f,%f,%f),(%f,%f,%f),(%f,%f,%f))",
 		    &px, &py, &pz, &dx, &dy, &dz, &ux, &uy, &uz);
 	if (n != 9)
+		n = std::sscanf(s, "((%f,%f,%f), (%f,%f,%f), (%f,%f,%f))",
+		    &px, &py, &pz, &dx, &dy, &dz, &ux, &uy, &uz);
+	if (n != 9)
 		n = std::sscanf(s,
 		    " (( %f , %f , %f ) , ( %f , %f , %f ) , ( %f , %f , %f ) )",
 		    &px, &py, &pz, &dx, &dy, &dz, &ux, &uy, &uz);
@@ -466,6 +491,12 @@ static bool ParseCameraSpec(const char *s, Vec3f &outPos, Vec3f &outDir, Vec3f &
 	}
 	if (outUp.length() < 1e-9f) {
 		std::fprintf(stderr, "Camera: up vector length is ~0.\n");
+		return false;
+	}
+	// mr-math Camera builds an orthonormal basis from dir×up; near-parallel vectors explode in normalize_unchecked().
+	Vec3f cross = outDir.cross(outUp);
+	if (cross.length2() < 1e-24f) {
+		std::fprintf(stderr, "Camera: direction and up are nearly parallel (|dir×up|² too small).\n");
 		return false;
 	}
 	return true;
@@ -609,7 +640,7 @@ int main(int argc, char **argv) {
 	CheckGl("FBO setup");
 
 	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort) {
-		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create();
+		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
 		moc->SetResolution((unsigned)kFbW, (unsigned)kFbH);
 		moc->SetNearClipPlane(nearP);
 		moc->ClearBuffer();
@@ -634,20 +665,28 @@ int main(int argc, char **argv) {
 			Vec4f hb = cb3 * objects[b].model;
 			Vec3f ca{ha.x(), ha.y(), ha.z()};
 			Vec3f cb{hb.x(), hb.y(), hb.z()};
-			return DepthKey(ca, camPosForSort) < DepthKey(cb, camPosForSort);
+			const float da = DepthKey(ca, camPosForSort);
+			const float db = DepthKey(cb, camPosForSort);
+			if (da < db)
+				return true;
+			if (db < da)
+				return false;
+			return a < b;
 		});
 
 		float mvpCol[16];
 		for (size_t k : order) {
 			const SceneObject &o = objects[k];
+			const Mesh &mesh = *o.mesh;
+			if (!MeshIsDrawable(mesh))
+				continue;
 			Matr4f mvp = o.model * vp;
 			MrMatrToColumnMajorGl(mvp, mvpCol);
-			const Mesh &mesh = *o.mesh;
 			std::vector<float> clipVerts(mesh.positions.size() * 4);
 			MaskedOcclusionCulling::TransformVertices(
 			    mvpCol,
 			    &mesh.positions[0].x,
-			    &clipVerts[0],
+			    clipVerts.data(),
 			    (unsigned)mesh.positions.size(),
 			    MaskedOcclusionCulling::VertexLayout(12, 4, 8));
 			moc->RenderTriangles(
@@ -686,14 +725,16 @@ int main(int argc, char **argv) {
 			if (!frustumHit[i])
 				continue;
 			const SceneObject &o = objects[i];
+			const Mesh &mesh = *o.mesh;
+			if (!MeshIsDrawable(mesh))
+				continue;
 			Matr4f mvp = o.model * vp;
 			MrMatrToColumnMajorGl(mvp, mvpCol);
-			const Mesh &mesh = *o.mesh;
 			std::vector<float> clipVerts(mesh.positions.size() * 4);
 			MaskedOcclusionCulling::TransformVertices(
 			    mvpCol,
 			    &mesh.positions[0].x,
-			    &clipVerts[0],
+			    clipVerts.data(),
 			    (unsigned)mesh.positions.size(),
 			    MaskedOcclusionCulling::VertexLayout(12, 4, 8));
 			MaskedOcclusionCulling::CullingResult r = moc->TestTriangles(
@@ -725,6 +766,8 @@ int main(int argc, char **argv) {
 
 		for (size_t i = 0; i < objects.size(); ++i) {
 			const SceneObject &o = objects[i];
+			if (!MeshIsDrawable(*o.mesh))
+				continue;
 			Matr4f mvp = o.model * vp;
 			MrMatrToColumnMajorGl(mvp, mvpCol);
 			glUniformMatrix4fv(locMvp, 1, GL_FALSE, mvpCol);

@@ -36,12 +36,13 @@
 		return idx;
 	}
 
-	FORCE_INLINE void *aligned_alloc(size_t alignment, size_t size)
+	// Distinct names avoid clashes with C11 aligned_alloc / libc and keep alloc/free paired.
+	FORCE_INLINE void *moc_aligned_alloc(size_t alignment, size_t size)
 	{
 		return _aligned_malloc(size, alignment);
 	}
 
-	FORCE_INLINE void aligned_free(void *ptr)
+	FORCE_INLINE void moc_aligned_free(void *ptr)
 	{
 		_aligned_free(ptr);
 	}
@@ -53,11 +54,7 @@
 
 #elif defined(__GNUG__)	|| defined(__clang__) // G++ or clang
 	#include <cpuid.h>
-#if defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__)
-	#include <malloc/malloc.h> // memalign
-#else
-	#include <malloc.h> // memalign
-#endif
+	#include <stdlib.h>
 	#include <mm_malloc.h>
 	#include <immintrin.h>
 	#include <new>
@@ -72,12 +69,17 @@
 		return idx;
 	}
 
-	FORCE_INLINE void *aligned_alloc(size_t alignment, size_t size)
+	FORCE_INLINE void *moc_aligned_alloc(size_t alignment, size_t size)
 	{
-		return memalign(alignment, size);
+		if (size == 0)
+			return nullptr;
+		void *p = nullptr;
+		if (posix_memalign(&p, alignment, size) != 0)
+			return nullptr;
+		return p;
 	}
 
-	FORCE_INLINE void aligned_free(void *ptr)
+	FORCE_INLINE void moc_aligned_free(void *ptr)
 	{
 		free(ptr);
 	}
