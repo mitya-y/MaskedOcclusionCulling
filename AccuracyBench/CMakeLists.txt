@@ -36,6 +36,27 @@ if(NOT mr_math_fc_POPULATED)
 	FetchContent_Populate(mr_math_fc)
 endif()
 
+set(TINYUSDZ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(TINYUSDZ_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(TINYUSDZ_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(TINYUSDZ_NO_WERROR ON CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+	tinyusdz_fc
+	GIT_REPOSITORY https://github.com/lighttransport/tinyusdz.git
+	GIT_TAG release
+	GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(tinyusdz_fc)
+# TinyUSDZ nonstd::expected conflicts with C++23 std::expected on some libstdc++.
+if(TARGET tinyusdz_static)
+	set_target_properties(tinyusdz_static PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+	if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+		target_compile_options(tinyusdz_static PRIVATE -include
+			${CMAKE_CURRENT_SOURCE_DIR}/tinyusdz_forced_stdint.h)
+	endif()
+endif()
+
 add_library(mr-math-lib INTERFACE)
 target_include_directories(mr-math-lib INTERFACE ${mr_math_fc_SOURCE_DIR}/include)
 target_link_libraries(mr-math-lib INTERFACE Vc)
@@ -49,14 +70,19 @@ target_compile_definitions(MaskedOcclusionCulling PRIVATE USE_D3D=0)
 add_executable(AccuracyBench
 	main.cpp
 	cgltf_impl.cpp
+	usd_load.cpp
 )
+# Per-source CXX_STANDARD is ignored by some generators; force language version for TinyUSDZ headers.
+set_source_files_properties(usd_load.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")
 
 target_include_directories(AccuracyBench PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}
+	${tinyusdz_fc_SOURCE_DIR}/src
 )
 
 target_link_libraries(AccuracyBench PRIVATE
 	mr-math-lib
+	tinyusdz::tinyusdz_static
 	MaskedOcclusionCulling
 	OpenGL::GL
 	GLEW::GLEW
@@ -64,6 +90,7 @@ target_link_libraries(AccuracyBench PRIVATE
 )
 
 target_compile_definitions(AccuracyBench PRIVATE USE_D3D=0)
+target_compile_features(AccuracyBench PRIVATE cxx_std_23)
 
 if(NOT WIN32)
 	target_link_libraries(AccuracyBench PRIVATE pthread dl)
