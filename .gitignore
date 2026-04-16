@@ -3,3 +3,6 @@ Example/build/*
 FillrateTest/build/*
 AccuracyBench/build/*
 assets/*
+AccuracyBench/CMakeUserPresets.json
+build-ab/*
+
