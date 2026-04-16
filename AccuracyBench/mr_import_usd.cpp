@@ -28,7 +28,7 @@ bool LoadStage(const char *path, std::vector<accbench::usd::MeshBuffers> &meshes
 		return false;
 	}
 
-	std::fprintf(stderr, "USD (mr-importer): mr::import starting (OpenUSD + payloads)…\n");
+	std::fprintf(stderr, "mr-importer: mr::import starting…\n");
 	std::fflush(stderr);
 
 	using enum mr::importer::Options;
@@ -79,7 +79,7 @@ bool LoadStage(const char *path, std::vector<accbench::usd::MeshBuffers> &meshes
 		return false;
 	}
 
-	std::fprintf(stderr, "USD (mr-importer): %zu meshes, %zu instances\n", meshes.size(), instances.size());
+	std::fprintf(stderr, "mr-importer: %zu meshes, %zu instances\n", meshes.size(), instances.size());
 	std::fflush(stderr);
 	return true;
 }

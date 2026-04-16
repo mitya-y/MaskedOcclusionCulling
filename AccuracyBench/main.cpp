@@ -558,6 +558,21 @@ static bool FillObjectsFromUsd(std::vector<accbench::usd::MeshBuffers> &umb,
 	return !objects.empty();
 }
 
+#if ACCBENCH_HAVE_MR_IMPORTER
+static bool TryLoadPathViaMrImporter(const char *path, std::vector<SceneObject> &objects, std::string &err) {
+	err.clear();
+	std::vector<accbench::usd::MeshBuffers> umb;
+	std::vector<accbench::usd::Instance> uinst;
+	if (!accbench::mrimp::LoadStage(path, umb, uinst, err))
+		return false;
+	if (!FillObjectsFromUsd(umb, uinst, objects)) {
+		err = "mr-importer: no drawable objects after import";
+		return false;
+	}
+	return true;
+}
+#endif
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
@@ -592,7 +607,18 @@ int main(int argc, char **argv) {
 	if (objPath) {
 		bool ok = false;
 		if (EndsWithIgnoreCase(objPath, ".glb") || EndsWithIgnoreCase(objPath, ".gltf")) {
-			ok = LoadGltfMeshes(objPath, objects);
+			ok = false;
+#if ACCBENCH_HAVE_MR_IMPORTER
+			{
+				std::string ue;
+				if (TryLoadPathViaMrImporter(objPath, objects, ue))
+					ok = true;
+				else if (!ue.empty())
+					fprintf(stderr, "glTF (mr-importer): %s — trying cgltf…\n", ue.c_str());
+			}
+#endif
+			if (!ok)
+				ok = LoadGltfMeshes(objPath, objects);
 		} else if (EndsWithIgnoreCase(objPath, ".usd") || EndsWithIgnoreCase(objPath, ".usda") ||
 		    EndsWithIgnoreCase(objPath, ".usdc") || EndsWithIgnoreCase(objPath, ".usdz")) {
 			std::vector<accbench::usd::MeshBuffers> umb;
@@ -600,8 +626,8 @@ int main(int argc, char **argv) {
 			std::string uw, ue;
 			ok = false;
 #if ACCBENCH_HAVE_MR_IMPORTER
-			if (accbench::mrimp::LoadStage(objPath, umb, uinst, ue))
-				ok = FillObjectsFromUsd(umb, uinst, objects);
+			if (TryLoadPathViaMrImporter(objPath, objects, ue))
+				ok = true;
 			if (!ok) {
 				if (!ue.empty())
 					fprintf(stderr, "USD (mr-importer): %s — trying TinyUSDZ path…\n", ue.c_str());
