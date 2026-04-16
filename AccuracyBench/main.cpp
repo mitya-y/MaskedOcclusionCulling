@@ -28,6 +28,9 @@
 
 #include "accuracy_camera.hpp"
 #include "usd_load.hpp"
+#if ACCBENCH_HAVE_MR_IMPORTER
+#include "mr_import_usd.hpp"
+#endif
 
 #include "../MaskedOcclusionCulling.h"
 
@@ -527,6 +530,33 @@ static void ScrollCallback(GLFWwindow *, double, double yoff) {
 	g_scrollAccum += yoff;
 }
 
+static bool FillObjectsFromUsd(std::vector<accbench::usd::MeshBuffers> &umb,
+    std::vector<accbench::usd::Instance> &uinst, std::vector<SceneObject> &objects) {
+	objects.clear();
+	uint32_t nextId = 1;
+	std::vector<std::shared_ptr<Mesh>> meshByIdx(umb.size());
+	for (size_t mi = 0; mi < umb.size(); ++mi) {
+		auto m = std::make_shared<Mesh>();
+		m->positions.reserve(umb[mi].positions.size());
+		for (const auto &p : umb[mi].positions)
+			m->positions.push_back(PackedVec3f{p[0], p[1], p[2]});
+		m->indices = std::move(umb[mi].indices);
+		MeshComputeAabb(*m);
+		meshByIdx[mi] = std::move(m);
+	}
+	for (const auto &inst : uinst) {
+		if (inst.meshIndex < 0 || static_cast<size_t>(inst.meshIndex) >= meshByIdx.size())
+			continue;
+		SceneObject obj;
+		obj.id = nextId++;
+		obj.model = Matr4FromColumnMajor(inst.modelColumnMajor);
+		obj.mesh = meshByIdx[static_cast<size_t>(inst.meshIndex)];
+		if (!obj.mesh->indices.empty())
+			objects.push_back(std::move(obj));
+	}
+	return !objects.empty();
+}
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
@@ -567,36 +597,24 @@ int main(int argc, char **argv) {
 			std::vector<accbench::usd::MeshBuffers> umb;
 			std::vector<accbench::usd::Instance> uinst;
 			std::string uw, ue;
-			if (accbench::usd::LoadStage(objPath, umb, uinst, uw, ue)) {
+			ok = false;
+#if ACCBENCH_HAVE_MR_IMPORTER
+			if (accbench::mrimp::LoadStage(objPath, umb, uinst, ue))
+				ok = FillObjectsFromUsd(umb, uinst, objects);
+			if (!ok) {
+				if (!ue.empty())
+					fprintf(stderr, "USD (mr-importer): %s — trying TinyUSDZ path…\n", ue.c_str());
+				umb.clear();
+				uinst.clear();
+				ue.clear();
+			}
+#endif
+			if (!ok && accbench::usd::LoadStage(objPath, umb, uinst, uw, ue)) {
 				if (!uw.empty())
 					fprintf(stderr, "USD warn: %s\n", uw.c_str());
-				objects.clear();
-				uint32_t nextId = 1;
-				std::vector<std::shared_ptr<Mesh>> meshByIdx(umb.size());
-				for (size_t mi = 0; mi < umb.size(); ++mi) {
-					auto m = std::make_shared<Mesh>();
-					m->positions.reserve(umb[mi].positions.size());
-					for (const auto &p : umb[mi].positions)
-						m->positions.push_back(PackedVec3f{p[0], p[1], p[2]});
-					m->indices = std::move(umb[mi].indices);
-					MeshComputeAabb(*m);
-					meshByIdx[mi] = std::move(m);
-				}
-				for (const auto &inst : uinst) {
-					if (inst.meshIndex < 0 ||
-					    static_cast<size_t>(inst.meshIndex) >= meshByIdx.size())
-						continue;
-					SceneObject obj;
-					obj.id = nextId++;
-					obj.model = Matr4FromColumnMajor(inst.modelColumnMajor);
-					obj.mesh = meshByIdx[static_cast<size_t>(inst.meshIndex)];
-					if (!obj.mesh->indices.empty())
-						objects.push_back(std::move(obj));
-				}
-				ok = !objects.empty();
-			} else {
+				ok = FillObjectsFromUsd(umb, uinst, objects);
+			} else if (!ok) {
 				fprintf(stderr, "USD load failed: %s\n", ue.c_str());
-				ok = false;
 			}
 		} else {
 			ok = LoadObjMeshes(objPath, objects);

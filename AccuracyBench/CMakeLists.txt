@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.27)
 project(AccuracyBench LANGUAGES CXX)
 
+# Fast USD path via 4J mr-importer (OpenUSD). Requires Conan (or equivalent) to provide
+# mr-importer and all of its dependencies (pxr, meshoptimizer, fastgltf, …).
+option(
+	ACCURACYBENCH_USE_MR_IMPORTER
+	"Link mr-importer for USD (OpenUSD). Requires installed mr-importer (Conan CMakeDeps or cmake --install prefix)."
+	OFF
+)
+set(
+	ACCURACYBENCH_CONAN_GENERATORS ""
+	CACHE
+	PATH
+	"Folder containing mr-importer-config.cmake from Conan CMakeDeps (optional; also auto-searched under CMAKE_BINARY_DIR)."
+)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -74,6 +88,52 @@ add_executable(AccuracyBench
 )
 # Per-source CXX_STANDARD is ignored by some generators; force language version for TinyUSDZ headers.
 set_source_files_properties(usd_load.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")
+
+if(ACCURACYBENCH_USE_MR_IMPORTER)
+	if(ACCURACYBENCH_CONAN_GENERATORS)
+		list(PREPEND CMAKE_PREFIX_PATH "${ACCURACYBENCH_CONAN_GENERATORS}")
+	endif()
+	# Conan CMakeDeps often writes configs under <binary-dir>/generators or <binary-dir>/<Config>/generators.
+	foreach(
+		_accbench_gen
+		IN
+		ITEMS
+			"${CMAKE_BINARY_DIR}/generators"
+			"${CMAKE_BINARY_DIR}/Release/generators"
+			"${CMAKE_BINARY_DIR}/Debug/generators"
+	)
+		if(IS_DIRECTORY "${_accbench_gen}")
+			list(PREPEND CMAKE_PREFIX_PATH "${_accbench_gen}")
+		endif()
+	endforeach()
+
+	find_package(mr-importer CONFIG QUIET)
+	if(NOT mr-importer_FOUND)
+		message(
+			FATAL_ERROR
+			"ACCURACYBENCH_USE_MR_IMPORTER is ON but CMake could not find package \"mr-importer\" "
+			"(mr-importer-config.cmake / mr-importerConfig.cmake).\n"
+			"That library is not bundled here: it pulls OpenUSD and other deps (see "
+			"https://github.com/4J-company/mr-importer, conanfile.py).\n"
+			"After you build or `conan install` mr-importer, point CMake at the CMake package:\n"
+			"  cmake ... -DCMAKE_PREFIX_PATH=\"<dir-containing-mr-importer-config.cmake>\" ...\n"
+			"or: -Dmr-importer_DIR=<that-dir>\n"
+			"or: -DACCURACYBENCH_CONAN_GENERATORS=<Conan CMakeDeps output folder>\n"
+			"If you already ran Conan with output-folder=build, try leaving generators under "
+			"${CMAKE_BINARY_DIR}/generators (this file prepends existing .../generators to the search path)."
+		)
+	endif()
+	target_sources(AccuracyBench PRIVATE mr_import_usd.cpp)
+	if(TARGET mr-importer::mr-importer-lib)
+		set(_accbench_mr_import_tgt mr-importer::mr-importer-lib)
+	elseif(TARGET mr-importer-lib)
+		set(_accbench_mr_import_tgt mr-importer-lib)
+	else()
+		message(FATAL_ERROR "ACCURACYBENCH_USE_MR_IMPORTER: expected target mr-importer::mr-importer-lib")
+	endif()
+	target_link_libraries(AccuracyBench PRIVATE ${_accbench_mr_import_tgt})
+	target_compile_definitions(AccuracyBench PRIVATE ACCBENCH_HAVE_MR_IMPORTER=1)
+endif()
 
 target_include_directories(AccuracyBench PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}
