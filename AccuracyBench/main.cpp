@@ -383,41 +383,56 @@ static void ObjectWorldCorners(const SceneObject &o, Vec3f wOut[8]) {
 	}
 }
 
-static Vec4f NormalizePlane(Vec4f p) {
-	Vec3f n{p.x(), p.y(), p.z()};
-	float len = n.length();
-	if (len < 1e-9f)
-		return p;
-	return Vec4f{n.x() / len, n.y() / len, n.z() / len, p.w() / len};
+// Same frustum setup as mr-graphics FPSCamera::frustum_planes() (camera.hpp) + AABB test as in bounds.h
+// (transform_bound_box min/max, is_bound_box_not_visible / is_bound_box_frustum_visible).
+static void FrustumPlanesMrGraphics(const Matr4f &viewProj, Vec4f planes[6]) {
+	Matr4f vp = viewProj.transposed();
+	planes[0] = vp[3] + vp[0];
+	planes[1] = vp[3] - vp[0];
+	planes[2] = vp[3] + vp[1];
+	planes[3] = vp[3] - vp[1];
+	planes[4] = vp[3] + vp[2];
+	planes[5] = vp[3] - vp[2];
+	for (int i = 0; i < 6; ++i) {
+		Vec3f n{planes[i].x(), planes[i].y(), planes[i].z()};
+		float len = n.length();
+		if (len > 1e-20f)
+			planes[i] = planes[i] * (1.f / len);
+	}
 }
 
-static void FrustumPlanesFromVp(const Matr4f &vp, Vec4f planes[6]) {
-	Matr4f t = vp.transposed();
-	Vec4f r0{t[0][0], t[0][1], t[0][2], t[0][3]};
-	Vec4f r1{t[1][0], t[1][1], t[1][2], t[1][3]};
-	Vec4f r2{t[2][0], t[2][1], t[2][2], t[2][3]};
-	Vec4f r3{t[3][0], t[3][1], t[3][2], t[3][3]};
-	planes[0] = NormalizePlane(r3 + r0);
-	planes[1] = NormalizePlane(r3 - r0);
-	planes[2] = NormalizePlane(r3 + r1);
-	planes[3] = NormalizePlane(r3 - r1);
-	planes[4] = NormalizePlane(r3 + r2);
-	planes[5] = NormalizePlane(r3 - r2);
+static void WorldAabbFromCorners(const Vec3f wCorners[8], Vec3f &outMin, Vec3f &outMax) {
+	outMin = outMax = wCorners[0];
+	for (int i = 1; i < 8; ++i) {
+		outMin = Vec3f{std::min(outMin.x(), wCorners[i].x()), std::min(outMin.y(), wCorners[i].y()),
+		    std::min(outMin.z(), wCorners[i].z())};
+		outMax = Vec3f{std::max(outMax.x(), wCorners[i].x()), std::max(outMax.y(), wCorners[i].y()),
+		    std::max(outMax.z(), wCorners[i].z())};
+	}
 }
 
-static bool ObjectIntersectsFrustum(const Matr4f &vp, const Vec3f wCorners[8]) {
-	Vec4f planes[6];
-	FrustumPlanesFromVp(vp, planes);
-	for (int p = 0; p < 6; ++p) {
-		int outside = 0;
-		for (int i = 0; i < 8; ++i) {
-			Vec4f cl = Vec4f{wCorners[i].x(), wCorners[i].y(), wCorners[i].z(), 1.f} * vp;
-			float d = planes[p].x() * cl.x() + planes[p].y() * cl.y() + planes[p].z() * cl.z()
-			    + planes[p].w() * cl.w();
-			if (d < 0.f)
-				outside++;
-		}
-		if (outside == 8)
+// bounds.h: is_bound_box_not_visible — returns true if this plane alone culls the box.
+static bool IsBoundBoxNotVisibleMrGraphics(const Vec4f &plane, const Vec3f &bbMin, const Vec3f &bbMax) {
+	Vec3f positive{plane.x() >= 0.f ? bbMax.x() : bbMin.x(), plane.y() >= 0.f ? bbMax.y() : bbMin.y(),
+	    plane.z() >= 0.f ? bbMax.z() : bbMin.z()};
+	Vec3f negative{plane.x() >= 0.f ? bbMin.x() : bbMax.x(), plane.y() >= 0.f ? bbMin.y() : bbMax.y(),
+	    plane.z() >= 0.f ? bbMin.z() : bbMax.z()};
+	const float dotNeg =
+	    plane.x() * negative.x() + plane.y() * negative.y() + plane.z() * negative.z() + plane.w();
+	if (dotNeg > 0.f)
+		return false;
+	const float dotPos =
+	    plane.x() * positive.x() + plane.y() * positive.y() + plane.z() * positive.z() + plane.w();
+	if (dotPos < 0.f)
+		return true;
+	return false;
+}
+
+static bool IsWorldAabbFrustumVisibleMrGraphics(const Vec4f frustumPlanes[6], const Vec3f wCorners[8]) {
+	Vec3f bbMin, bbMax;
+	WorldAabbFromCorners(wCorners, bbMin, bbMax);
+	for (int i = 0; i < 6; ++i) {
+		if (IsBoundBoxNotVisibleMrGraphics(frustumPlanes[i], bbMin, bbMax))
 			return false;
 	}
 	return true;
@@ -718,11 +733,14 @@ int main(int argc, char **argv) {
 		std::vector<MaskedOcclusionCulling::CullingResult> mocRaw(nAll);
 		std::vector<char> gpuVis(nAll, 0);
 
+		Vec4f frustumPlanes[6];
+		FrustumPlanesMrGraphics(vp, frustumPlanes);
+
 		for (size_t i = 0; i < objects.size(); ++i) {
 			const SceneObject &o = objects[i];
 			Vec3f wcorners[8];
 			ObjectWorldCorners(o, wcorners);
-			bool inf = ObjectIntersectsFrustum(vp, wcorners);
+			bool inf = IsWorldAabbFrustumVisibleMrGraphics(frustumPlanes, wcorners);
 			frustumHit[i] = inf ? 1 : 0;
 			if (inf)
 				++nFrustum;
@@ -837,8 +855,8 @@ int main(int argc, char **argv) {
 			    "       TestTriangles on that clip stream (see MaskedOcclusionCulling README: uses w, ~1/w depth).\n"
 			    "  OpenGL: VBO = same local positions; vertex shader gl_Position = MVP * vec4(aPos,1).\n"
 			    "          Fragment shader writes uvec4(0,0,0, objectId) to RGBA32UI; depth buffer GL_LESS.\n"
-			    "  Frustum column: AABB corners transformed model->world, then VP->clip; reject if all 8\n"
-			    "          corners lie outside one frustum plane (homogeneous clip test).\n\n");
+			    "  Frustum stats: same as mr-graphics — planes from viewProj().transposed() (vp[3]±vp[0..2]),\n"
+			    "          normalized; world AABB = min/max of 8 local-AABB corners * model; bounds.h-style test.\n\n");
 			printf("Camera pos (%.2f, %.2f, %.2f)  dir (%.2f, %.2f, %.2f)  up (%.2f, %.2f, %.2f)\n",
 			    camPos.x(), camPos.y(), camPos.z(), camDir.x(), camDir.y(), camDir.z(), camUp.x(), camUp.y(),
 			    camUp.z());
