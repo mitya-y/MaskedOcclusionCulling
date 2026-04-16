@@ -644,10 +644,12 @@ int main(int argc, char **argv) {
 	}
 	CheckGl("FBO setup");
 
-	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort) {
+	enum class BenchPrintStyle { Full, LiveFour };
+
+	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort, BenchPrintStyle printStyle) {
 		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
 		moc->SetResolution((unsigned)kFbW, (unsigned)kFbH);
-		moc->SetNearClipPlane(nearP);
+		moc->SetNearClipPlane(fps.cam().projection().distance);
 		moc->ClearBuffer();
 
 		std::vector<size_t> order(objects.size());
@@ -820,70 +822,77 @@ int main(int argc, char **argv) {
 				++fn;
 		}
 
-		Vec3f camPos = fps.cam().position();
-		Vec3f camDir = Vec3f(fps.cam().direction());
-		Vec3f camUp = Vec3f(fps.cam().up());
-		Vec3f target = camPos + camDir;
+		if (printStyle == BenchPrintStyle::Full) {
+			Vec3f camPos = fps.cam().position();
+			Vec3f camDir = Vec3f(fps.cam().direction());
+			Vec3f camUp = Vec3f(fps.cam().up());
+			Vec3f target = camPos + camDir;
 
-		printf("\n");
-		printf("=== How geometry is drawn (same MVP on CPU and GPU) ===\n");
-		printf(
-		    "  Mesh vertices are in object/local space (OBJ shape or unit cube).\n"
-		    "  mr-math: p_clip_row = p_local * model * (view*proj); GL/MOC get column-major uMVP = that 4×4 (mr layout matches glm columns as rows).\n"
-		    "  MOC: TransformVertices(MVP, local xyz) -> clip (x,y,z,w), then RenderTriangles /\n"
-		    "       TestTriangles on that clip stream (see MaskedOcclusionCulling README: uses w, ~1/w depth).\n"
-		    "  OpenGL: VBO = same local positions; vertex shader gl_Position = MVP * vec4(aPos,1).\n"
-		    "          Fragment shader writes uvec4(0,0,0, objectId) to RGBA32UI; depth buffer GL_LESS.\n"
-		    "  Frustum column: AABB corners transformed model->world, then VP->clip; reject if all 8\n"
-		    "          corners lie outside one frustum plane (homogeneous clip test).\n\n");
-		printf("Camera pos (%.2f, %.2f, %.2f)  dir (%.2f, %.2f, %.2f)  up (%.2f, %.2f, %.2f)\n",
-		    camPos.x(), camPos.y(), camPos.z(), camDir.x(), camDir.y(), camDir.z(), camUp.x(), camUp.y(),
-		    camUp.z());
-		printf("  -> look-at target (%.2f, %.2f, %.2f)   FOV 45° (mr Scene)   near %.2f  far %.2f\n",
-		    target.x(), target.y(), target.z(), nearP, fps.cam().projection().far);
-
-		if (perObjectReport) {
-			printf("\n=== Per-object (translation column; id = GPU/MRT .a) ===\n");
+			printf("\n");
+			printf("=== How geometry is drawn (same MVP on CPU and GPU) ===\n");
 			printf(
-			    "%-4s %-5s %5s %5s %10s %10s %10s  %-7s  %-14s  %s\n",
-			    "#", "id", "vtx", "tri", "tx", "ty", "tz", "frustum", "MOC", "GPU_pixel");
-			for (size_t i = 0; i < objects.size(); ++i) {
-				const SceneObject &o = objects[i];
-				float tx = o.model[0][3];
-				float ty = o.model[1][3];
-				float tz = o.model[2][3];
-				const char *fr = frustumHit[i] ? "yes" : "no";
-				const char *mocS = mocTested[i] ? MocResultStr(mocRaw[i]) : "—";
-				const char *gpuS = gpuVis[i] ? "yes" : "no";
-				printf(
-				    "%-4zu %-5u %5zu %5zu %10.2f %10.2f %10.2f  %-7s  %-14s  %s\n",
-				    i, o.id, o.mesh->positions.size(), o.mesh->indices.size() / 3, tx, ty, tz, fr, mocS, gpuS);
-			}
-		}
+			    "  Mesh vertices are in object/local space (OBJ shape or unit cube).\n"
+			    "  mr-math: p_clip_row = p_local * model * (view*proj); GL/MOC get column-major uMVP = that 4×4 (mr layout matches glm columns as rows).\n"
+			    "  MOC: TransformVertices(MVP, local xyz) -> clip (x,y,z,w), then RenderTriangles /\n"
+			    "       TestTriangles on that clip stream (see MaskedOcclusionCulling README: uses w, ~1/w depth).\n"
+			    "  OpenGL: VBO = same local positions; vertex shader gl_Position = MVP * vec4(aPos,1).\n"
+			    "          Fragment shader writes uvec4(0,0,0, objectId) to RGBA32UI; depth buffer GL_LESS.\n"
+			    "  Frustum column: AABB corners transformed model->world, then VP->clip; reject if all 8\n"
+			    "          corners lie outside one frustum plane (homogeneous clip test).\n\n");
+			printf("Camera pos (%.2f, %.2f, %.2f)  dir (%.2f, %.2f, %.2f)  up (%.2f, %.2f, %.2f)\n",
+			    camPos.x(), camPos.y(), camPos.z(), camDir.x(), camDir.y(), camDir.z(), camUp.x(), camUp.y(),
+			    camUp.z());
+			printf("  -> look-at target (%.2f, %.2f, %.2f)   FOV 45° (mr Scene)   near %.2f  far %.2f\n",
+			    target.x(), target.y(), target.z(), nearP, fps.cam().projection().far);
 
-		printf("\n--- AccuracyBench (MaskedOcclusionCulling vs RGBA32UI id in .a) ---\n");
-		printf("Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f\n",
-		    kFbW, kFbH, USE_D3D, nearP);
-		printf("1) All objects:              %u\n", nAll);
-		printf("2) AABB in frustum:          %u\n", nFrustum);
-		printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", nMocVisible);
-		printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", nGpuVisible);
-		printf("--- errors (frustum subset only) ---\n");
-		printf("False positives (MOC visible, GPU no pixel): %u\n", fp);
-		printf("False negatives (MOC occluded/culled, GPU pixel): %u\n", fn);
-		printf("(Conservative culling should avoid false negatives; a non-zero count means mismatch.)\n");
-		fflush(stdout);
+			if (perObjectReport) {
+				printf("\n=== Per-object (translation column; id = GPU/MRT .a) ===\n");
+				printf(
+				    "%-4s %-5s %5s %5s %10s %10s %10s  %-7s  %-14s  %s\n",
+				    "#", "id", "vtx", "tri", "tx", "ty", "tz", "frustum", "MOC", "GPU_pixel");
+				for (size_t i = 0; i < objects.size(); ++i) {
+					const SceneObject &o = objects[i];
+					float tx = o.model[0][3];
+					float ty = o.model[1][3];
+					float tz = o.model[2][3];
+					const char *fr = frustumHit[i] ? "yes" : "no";
+					const char *mocS = mocTested[i] ? MocResultStr(mocRaw[i]) : "—";
+					const char *gpuS = gpuVis[i] ? "yes" : "no";
+					printf(
+					    "%-4zu %-5u %5zu %5zu %10.2f %10.2f %10.2f  %-7s  %-14s  %s\n",
+					    i, o.id, o.mesh->positions.size(), o.mesh->indices.size() / 3, tx, ty, tz, fr, mocS, gpuS);
+				}
+			}
+
+			printf("\n--- AccuracyBench (MaskedOcclusionCulling vs RGBA32UI id in .a) ---\n");
+			printf("Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f\n",
+			    kFbW, kFbH, USE_D3D, nearP);
+			printf("1) All objects:              %u\n", nAll);
+			printf("2) AABB in frustum:          %u\n", nFrustum);
+			printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", nMocVisible);
+			printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", nGpuVisible);
+			printf("--- errors (frustum subset only) ---\n");
+			printf("False positives (MOC visible, GPU no pixel): %u\n", fp);
+			printf("False negatives (MOC occluded/culled, GPU pixel): %u\n", fn);
+			printf("(Conservative culling should avoid false negatives; a non-zero count means mismatch.)\n");
+			fflush(stdout);
+		} else {
+			std::fprintf(stderr, "\rACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u\033[K", nAll,
+			    nFrustum, nMocVisible, nGpuVisible);
+			std::fflush(stderr);
+		}
 
 		MaskedOcclusionCulling::Destroy(moc);
 	};
 
 	Matr4f vpBench = fps.viewProj();
 	Vec3f camPosBench = fps.cam().position();
-	runBenchmarkPass(vpBench, camPosBench);
+	runBenchmarkPass(vpBench, camPosBench, BenchPrintStyle::Full);
 
 	if (!headless) {
 		printf("\nInteractive preview: WASD + Space/Z, Shift sprint, mouse look, scroll = move speed; "
 		       "P = print pose; 1–6,0 = scene camera presets.\n");
+		printf("Live stats on stderr: 1)–4) counts refresh every frame (full MOC+GPU readback pass).\n");
 		printf("Close the window to quit.\n");
 		fflush(stdout);
 	}
@@ -972,6 +981,7 @@ int main(int argc, char **argv) {
 				glfwSetWindowShouldClose(win, GLFW_TRUE);
 
 			Matr4f vp = fps.viewProj();
+			runBenchmarkPass(vp, fps.cam().position(), BenchPrintStyle::LiveFour);
 			float mvpCol[16];
 
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1013,6 +1023,7 @@ int main(int argc, char **argv) {
 			CheckGl("preview draw");
 			glfwSwapBuffers(win);
 		}
+		std::fprintf(stderr, "\n");
 	}
 
 	glDeleteRenderbuffers(1, &depthRb);
