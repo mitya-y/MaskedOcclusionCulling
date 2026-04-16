@@ -42,8 +42,35 @@ using mr::PackedVec3f;
 using mr::Vec3f;
 using mr::Vec4f;
 using mr::math::Camera;
-constexpr int kFbW = 1280;
-constexpr int kFbH = 720;
+
+static bool ParseResolutionSpec(const char *spec, int &outW, int &outH) {
+	if (!spec || !*spec)
+		return false;
+	char *end = nullptr;
+	long w = std::strtol(spec, &end, 10);
+	if (end == spec || (*end != 'x' && *end != 'X'))
+		return false;
+	const char *hStart = end + 1;
+	if (!*hStart)
+		return false;
+	long h = std::strtol(hStart, &end, 10);
+	if (hStart == end || *end != '\0')
+		return false;
+	if (w <= 0 || h <= 0 || w > 65536 || h > 65536)
+		return false;
+	outW = (int)w;
+	outH = (int)h;
+	return true;
+}
+
+static void SnapMocResolution(int &w, int &h) {
+	const int w0 = w, h0 = h;
+	w = std::max(8, (w / 8) * 8);
+	h = std::max(4, (h / 4) * 4);
+	if (w != w0 || h != h0)
+		std::fprintf(stderr,
+		    "Resolution adjusted to %dx%d (MaskedOcclusionCulling: width multiple of 8, height of 4).\n", w, h);
+}
 
 const char *kVertSrc = R"(#version 330 core
 layout(location = 0) in vec3 aPos;
@@ -578,6 +605,8 @@ int main(int argc, char **argv) {
 	bool perObjectReport = false;
 	const char *objPath = nullptr;
 	const char *cameraSpec = nullptr;
+	int fbW = 1280;
+	int fbH = 720;
 	for (int i = 1; i < argc; ++i) {
 		if (!std::strcmp(argv[i], "--headless")) {
 			headless = true;
@@ -585,6 +614,34 @@ int main(int argc, char **argv) {
 		}
 		if (!std::strcmp(argv[i], "--per-object")) {
 			perObjectReport = true;
+			continue;
+		}
+		if (!std::strncmp(argv[i], "--resolution=", 13)) {
+			if (!ParseResolutionSpec(argv[i] + 13, fbW, fbH)) {
+				std::fprintf(stderr, "Invalid --resolution=WxH (example: --resolution=1920x1080).\n");
+				return 1;
+			}
+			SnapMocResolution(fbW, fbH);
+			continue;
+		}
+		if (!std::strncmp(argv[i], "--resoltuion=", 13)) {
+			if (!ParseResolutionSpec(argv[i] + 13, fbW, fbH)) {
+				std::fprintf(stderr, "Invalid --resoltuion=WxH (typo alias for --resolution=).\n");
+				return 1;
+			}
+			SnapMocResolution(fbW, fbH);
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--resolution")) {
+			if (i + 1 >= argc) {
+				std::fprintf(stderr, "--resolution requires WxH.\n");
+				return 1;
+			}
+			if (!ParseResolutionSpec(argv[++i], fbW, fbH)) {
+				std::fprintf(stderr, "Invalid --resolution WxH (example: 1920x1080).\n");
+				return 1;
+			}
+			SnapMocResolution(fbW, fbH);
 			continue;
 		}
 		if (!std::strncmp(argv[i], "--camera=", 9)) {
@@ -660,7 +717,7 @@ int main(int argc, char **argv) {
 	}
 
 	accbench::FpsCamera fps;
-	const float aspect0 = float(kFbW) / float(kFbH);
+	const float aspect0 = float(fbW) / float(fbH);
 	fps.configureProjection(aspect0);
 	if (cameraSpec) {
 		std::fprintf(stderr, "Parsing --camera: %s\n", cameraSpec);
@@ -682,7 +739,7 @@ int main(int argc, char **argv) {
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_VISIBLE, headless ? GLFW_FALSE : GLFW_TRUE);
 	GLFWwindow *win =
-	    glfwCreateWindow(kFbW, kFbH, "AccuracyBench - preview (close to exit)", nullptr, nullptr);
+	    glfwCreateWindow(fbW, fbH, "AccuracyBench - preview (close to exit)", nullptr, nullptr);
 	if (!win) {
 		fprintf(stderr, "glfwCreateWindow failed\n");
 		return 1;
@@ -731,11 +788,11 @@ int main(int argc, char **argv) {
 	glBindTexture(GL_TEXTURE_2D, colorTex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, kFbW, kFbH, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, nullptr);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, fbW, fbH, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, nullptr);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
 	glGenRenderbuffers(1, &depthRb);
 	glBindRenderbuffer(GL_RENDERBUFFER, depthRb);
-	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, kFbW, kFbH);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, fbW, fbH);
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRb);
 	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
 		fprintf(stderr, "FBO incomplete\n");
@@ -747,7 +804,7 @@ int main(int argc, char **argv) {
 
 	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort, BenchPrintStyle printStyle) {
 		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
-		moc->SetResolution((unsigned)kFbW, (unsigned)kFbH);
+		moc->SetResolution((unsigned)fbW, (unsigned)fbH);
 		moc->SetNearClipPlane(fps.cam().projection().distance);
 		const auto tMocBuffer0 = std::chrono::steady_clock::now();
 		moc->ClearBuffer();
@@ -870,7 +927,7 @@ int main(int argc, char **argv) {
 		const double mocQueryMs =
 		    std::chrono::duration<double, std::milli>(tMocQuery1 - tMocQuery0).count();
 
-		glViewport(0, 0, kFbW, kFbH);
+		glViewport(0, 0, fbW, fbH);
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 		const GLuint clearZ[4] = {0, 0, 0, 0};
 		glClearBufferuiv(GL_COLOR, 0, clearZ);
@@ -904,9 +961,9 @@ int main(int argc, char **argv) {
 		CheckGl("draw");
 		glFinish();
 
-		std::vector<unsigned> pixels((size_t)kFbW * (size_t)kFbH * 4);
+		std::vector<unsigned> pixels((size_t)fbW * (size_t)fbH * 4);
 		glReadBuffer(GL_COLOR_ATTACHMENT0);
-		glReadPixels(0, 0, kFbW, kFbH, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
+		glReadPixels(0, 0, fbW, fbH, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
 		CheckGl("readpixels");
 
 		std::unordered_set<uint32_t> uniq;
@@ -976,7 +1033,7 @@ int main(int argc, char **argv) {
 
 			printf("\n--- AccuracyBench (MaskedOcclusionCulling vs RGBA32UI id in .a) ---\n");
 			printf("Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f\n",
-			    kFbW, kFbH, USE_D3D, nearP);
+			    fbW, fbH, USE_D3D, nearP);
 			printf("1) All objects:              %u\n", nAll);
 			printf("2) AABB in frustum:          %u\n", nFrustum);
 			printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", nMocVisible);
@@ -1022,7 +1079,7 @@ int main(int argc, char **argv) {
 		while (!glfwWindowShouldClose(win)) {
 			glfwPollEvents();
 
-			int winW = kFbW, winH = kFbH;
+			int winW = fbW, winH = fbH;
 			glfwGetFramebufferSize(win, &winW, &winH);
 			const float asp = winH > 0 ? float(winW) / float(winH) : aspect0;
 			fps.configureProjection(asp);
@@ -1107,9 +1164,9 @@ int main(int argc, char **argv) {
 			glViewport(0, 0, winW, winH);
 			glClearColor(0.02f, 0.02f, 0.03f, 1.f);
 			glClear(GL_COLOR_BUFFER_BIT);
-			const float scale = std::min(winW / float(kFbW), winH / float(kFbH));
-			const int vw = std::max(1, (int)(kFbW * scale + 0.5f));
-			const int vh = std::max(1, (int)(kFbH * scale + 0.5f));
+			const float scale = std::min(winW / float(fbW), winH / float(fbH));
+			const int vw = std::max(1, (int)(fbW * scale + 0.5f));
+			const int vh = std::max(1, (int)(fbH * scale + 0.5f));
 			const int ox = (winW - vw) / 2;
 			const int oy = (winH - vh) / 2;
 			glViewport(ox, oy, vw, vh);
