@@ -46,6 +46,11 @@
 		_aligned_free(ptr);
 	}
 
+	FORCE_INLINE unsigned long long moc_xgetbv(unsigned int index)
+	{
+		return _xgetbv(index);
+	}
+
 #elif defined(__GNUG__)	|| defined(__clang__) // G++ or clang
 	#include <cpuid.h>
 #if defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__)
@@ -77,12 +82,19 @@
 		free(ptr);
 	}
 
+	// GCC 13+ declares __cpuidex in <cpuid.h>. Linux clang uses the same headers.
+	// Keep a shim only for older GCC and for non-Linux clang (e.g. macOS).
+#if (defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 13) \
+	|| (defined(__clang__) && !defined(__linux__))
 	FORCE_INLINE void __cpuidex(int* cpuinfo, int function, int subfunction)
 	{
 		__cpuid_count(function, subfunction, cpuinfo[0], cpuinfo[1], cpuinfo[2], cpuinfo[3]);
 	}
+#endif
 
-	FORCE_INLINE unsigned long long _xgetbv(unsigned int index)
+	// Avoid the compiler's always_inline _xgetbv from <immintrin.h>: MaskedOcclusionCulling.cpp
+	// is built with only SSE4.1, which triggers "target specific option mismatch" with the builtin.
+	FORCE_INLINE unsigned long long moc_xgetbv(unsigned int index)
 	{
 		unsigned int eax, edx;
 		__asm__ __volatile__(

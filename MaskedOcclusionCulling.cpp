@@ -63,8 +63,8 @@ static MaskedOcclusionCulling::Implementation DetectCPUFeatures(MaskedOcclusionC
 	#define TEST_FMA_MOVE_OXSAVE       (cpuIdCount >= 1 && TEST_BITS(cpuId[1].regs[2], (1 << 12) | (1 << 22) | (1 << 27)))
 	#define TEST_LZCNT                 (cpuIdExCount >= 1 && TEST_BITS(cpuIdEx[1].regs[2], 0x20))
 	#define TEST_SSE41                 (cpuIdCount >= 1 && TEST_BITS(cpuId[1].regs[2], (1 << 19)))
-	#define TEST_XMM_YMM               (cpuIdCount >= 1 && TEST_BITS(_xgetbv(0), (1 << 2) | (1 << 1)))
-	#define TEST_OPMASK_ZMM            (cpuIdCount >= 1 && TEST_BITS(_xgetbv(0), (1 << 7) | (1 << 6) | (1 << 5)))
+	#define TEST_XMM_YMM               (cpuIdCount >= 1 && TEST_BITS(moc_xgetbv(0), (1 << 2) | (1 << 1)))
+	#define TEST_OPMASK_ZMM            (cpuIdCount >= 1 && TEST_BITS(moc_xgetbv(0), (1 << 7) | (1 << 6) | (1 << 5)))
 	#define TEST_BMI1_BMI2_AVX2        (cpuIdCount >= 7 && TEST_BITS(cpuId[7].regs[1], (1 << 3) | (1 << 5) | (1 << 8)))
 	#define TEST_AVX512_F_BW_DQ        (cpuIdCount >= 7 && TEST_BITS(cpuId[7].regs[1], (1 << 16) | (1 << 17) | (1 << 30)))
 

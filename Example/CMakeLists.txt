@@ -1,4 +1,4 @@
-cmake_minimum_required( VERSION 2.6 )
+cmake_minimum_required( VERSION 3.5 )
 project( Example )
 set(CMAKE_SUPPRESS_REGENERATION true)
 set(CMAKE_CONFIGURATION_TYPES Debug Release)
