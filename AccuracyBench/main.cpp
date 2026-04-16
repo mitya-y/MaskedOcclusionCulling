@@ -512,11 +512,16 @@ static void ScrollCallback(GLFWwindow *, double, double yoff) {
 
 int main(int argc, char **argv) {
 	bool headless = false;
+	bool perObjectReport = false;
 	const char *objPath = nullptr;
 	const char *cameraSpec = nullptr;
 	for (int i = 1; i < argc; ++i) {
 		if (!std::strcmp(argv[i], "--headless")) {
 			headless = true;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--per-object")) {
+			perObjectReport = true;
 			continue;
 		}
 		if (!std::strncmp(argv[i], "--camera=", 9)) {
@@ -837,21 +842,23 @@ int main(int argc, char **argv) {
 		printf("  -> look-at target (%.2f, %.2f, %.2f)   FOV 45° (mr Scene)   near %.2f  far %.2f\n",
 		    target.x(), target.y(), target.z(), nearP, fps.cam().projection().far);
 
-		printf("\n=== Per-object (translation column; id = GPU/MRT .a) ===\n");
-		printf(
-		    "%-4s %-5s %5s %5s %10s %10s %10s  %-7s  %-14s  %s\n",
-		    "#", "id", "vtx", "tri", "tx", "ty", "tz", "frustum", "MOC", "GPU_pixel");
-		for (size_t i = 0; i < objects.size(); ++i) {
-			const SceneObject &o = objects[i];
-			float tx = o.model[0][3];
-			float ty = o.model[1][3];
-			float tz = o.model[2][3];
-			const char *fr = frustumHit[i] ? "yes" : "no";
-			const char *mocS = mocTested[i] ? MocResultStr(mocRaw[i]) : "—";
-			const char *gpuS = gpuVis[i] ? "yes" : "no";
+		if (perObjectReport) {
+			printf("\n=== Per-object (translation column; id = GPU/MRT .a) ===\n");
 			printf(
-			    "%-4zu %-5u %5zu %5zu %10.2f %10.2f %10.2f  %-7s  %-14s  %s\n",
-			    i, o.id, o.mesh->positions.size(), o.mesh->indices.size() / 3, tx, ty, tz, fr, mocS, gpuS);
+			    "%-4s %-5s %5s %5s %10s %10s %10s  %-7s  %-14s  %s\n",
+			    "#", "id", "vtx", "tri", "tx", "ty", "tz", "frustum", "MOC", "GPU_pixel");
+			for (size_t i = 0; i < objects.size(); ++i) {
+				const SceneObject &o = objects[i];
+				float tx = o.model[0][3];
+				float ty = o.model[1][3];
+				float tz = o.model[2][3];
+				const char *fr = frustumHit[i] ? "yes" : "no";
+				const char *mocS = mocTested[i] ? MocResultStr(mocRaw[i]) : "—";
+				const char *gpuS = gpuVis[i] ? "yes" : "no";
+				printf(
+				    "%-4zu %-5u %5zu %5zu %10.2f %10.2f %10.2f  %-7s  %-14s  %s\n",
+				    i, o.id, o.mesh->positions.size(), o.mesh->indices.size() / 3, tx, ty, tz, fr, mocS, gpuS);
+			}
 		}
 
 		printf("\n--- AccuracyBench (MaskedOcclusionCulling vs RGBA32UI id in .a) ---\n");
