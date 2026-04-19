@@ -10,11 +10,10 @@
 #include <cctype>
 #include <cmath>
 #include <cfloat>
+#include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <cstddef>
-#include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -43,6 +42,17 @@ using mr::PackedVec3f;
 using mr::Vec3f;
 using mr::Vec4f;
 using mr::math::Camera;
+
+static bool StrEqIgnoreCaseAscii(const char *a, const char *b) {
+	if (!a || !b)
+		return a == b;
+	for (; *a && *b; ++a, ++b) {
+		unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+		if (std::tolower(ca) != std::tolower(cb))
+			return false;
+	}
+	return *a == *b;
+}
 
 static bool ParseResolutionSpec(const char *spec, int &outW, int &outH) {
 	if (!spec || !*spec)
@@ -472,6 +482,96 @@ static bool IsWorldAabbFrustumVisibleMrGraphics(const Vec4f frustumPlanes[6], co
 	return true;
 }
 
+enum class MocOccludeeTestMode {
+	/// TestTriangles on full clip-space mesh (accurate, slower).
+	Mesh,
+	/// TestRect on NDC bounds of the world AABB (fast; more false positives vs GPU).
+	AabbScreenRect,
+};
+
+static Vec4f ClipEdgePointAtW(const Vec4f &a, const Vec4f &b, float wTarget) {
+	float wa = a.w(), wb = b.w();
+	float t = (wTarget - wa) / (wb - wa);
+	return Vec4f{
+	    a.x() + t * (b.x() - a.x()),
+	    a.y() + t * (b.y() - a.y()),
+	    a.z() + t * (b.z() - a.z()),
+	    a.w() + t * (wb - wa),
+	};
+}
+
+/*!
+ * Builds a screen-space NDC rect for TestRect from the world AABB: clip-space corners,
+ * edge intersections with w = wClip (so boxes crossing the camera plane still get a finite hull).
+ * Returns false only if there is no part of the hull with w >= wClip (fully behind); then use
+ * VIEW_CULLED, not mesh fallback.
+ * outWMinClip: minimum clip w over contributing points (conservative for MOC reversed depth).
+ */
+static bool TryWorldAabbProjectToTestRect(
+    const Vec3f worldCorners[8], const Matr4f &viewProj, float &outXmin, float &outYmin,
+    float &outXmax, float &outYmax, float &outWMinClip) {
+	// Same scale idea as a small positive clip w — avoids w=0 in NDC; edges are clipped to this plane.
+	const float wClip = 1e-4f;
+	Vec4f c[8];
+	for (int i = 0; i < 8; ++i)
+		c[i] = Vec4f{worldCorners[i].x(), worldCorners[i].y(), worldCorners[i].z(), 1.f} * viewProj;
+
+	static const int kEdges[12][2] = {
+	    {0, 1}, {1, 2}, {2, 3}, {3, 0},
+	    {4, 5}, {5, 6}, {6, 7}, {7, 4},
+	    {0, 4}, {1, 5}, {2, 6}, {3, 7},
+	};
+
+	float xmin = 0.f, xmax = 0.f, ymin = 0.f, ymax = 0.f;
+	float wMin = FLT_MAX;
+	bool have = false;
+
+	auto consider = [&](const Vec4f &p) {
+		float w = p.w();
+		if (w < wClip)
+			return;
+		float iw = 1.f / w;
+		float nx = p.x() * iw;
+		float ny = p.y() * iw;
+		if (!have) {
+			xmin = xmax = nx;
+			ymin = ymax = ny;
+			wMin = w;
+			have = true;
+		} else {
+			xmin = std::min(xmin, nx);
+			xmax = std::max(xmax, nx);
+			ymin = std::min(ymin, ny);
+			ymax = std::max(ymax, ny);
+			wMin = std::min(wMin, w);
+		}
+	};
+
+	for (int i = 0; i < 8; ++i)
+		consider(c[i]);
+
+	for (int e = 0; e < 12; ++e) {
+		const Vec4f &a = c[kEdges[e][0]];
+		const Vec4f &b = c[kEdges[e][1]];
+		float wa = a.w(), wb = b.w();
+		float denom = wb - wa;
+		if (std::fabs(denom) < 1e-30f)
+			continue;
+		float t = (wClip - wa) / denom;
+		if (t > 0.f && t < 1.f)
+			consider(ClipEdgePointAtW(a, b, wClip));
+	}
+
+	if (!have)
+		return false;
+	outXmin = xmin;
+	outXmax = xmax;
+	outYmin = ymin;
+	outYmax = ymax;
+	outWMinClip = wMin;
+	return true;
+}
+
 static float DepthKey(const Vec3f &worldCenter, const Vec3f &camPos) {
 	return (worldCenter - camPos).length();
 }
@@ -624,7 +724,32 @@ int main(int argc, char **argv) {
 	int fbH = 720;
 	float clipNear = 0.01f;
 	float clipFar = 1000.f;
+	MocOccludeeTestMode mocOccludeeTest = MocOccludeeTestMode::Mesh;
+	const char *mocTestEnv = std::getenv("ACCURACYBENCH_MOC_TEST");
+	if (mocTestEnv && mocTestEnv[0]) {
+		if (StrEqIgnoreCaseAscii(mocTestEnv, "aabb"))
+			mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
+		else if (!StrEqIgnoreCaseAscii(mocTestEnv, "mesh")) {
+			std::fprintf(stderr,
+			    "ACCURACYBENCH_MOC_TEST: expected 'mesh' or 'aabb' (got '%s'); using mesh.\n",
+			    mocTestEnv);
+		}
+	}
 	for (int i = 1; i < argc; ++i) {
+		if (!std::strncmp(argv[i], "--moc-test=", 11)) {
+			const char *v = argv[i] + 11;
+			if (!std::strcmp(v, "mesh"))
+				mocOccludeeTest = MocOccludeeTestMode::Mesh;
+			else if (!std::strcmp(v, "aabb"))
+				mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
+			else {
+				std::fprintf(stderr,
+				    "--moc-test= expects 'mesh' or 'aabb' (full mesh TestTriangles vs "
+				    "TestRect from world AABB in NDC).\n");
+				return 1;
+			}
+			continue;
+		}
 		if (!std::strcmp(argv[i], "--headless")) {
 			headless = true;
 			continue;
@@ -853,7 +978,26 @@ int main(int argc, char **argv) {
 
 	enum class BenchPrintStyle { Full, LiveFour };
 
-	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort, BenchPrintStyle printStyle) {
+	struct AccBenchPassResult {
+		unsigned nAll = 0;
+		unsigned nFrustum = 0;
+		unsigned nMocVisible = 0;
+		unsigned nGpuVisible = 0;
+		unsigned fp = 0;
+		unsigned fn = 0;
+		double mocBufferMs = 0;
+		double mocQueryMs = 0;
+		/// Offscreen RGBA32UI + depth: clear, upload, draw, glFinish (no readback).
+		double gpuRefMs = 0;
+		/// glReadPixels RGBA32UI readback (benchmark ground-truth fetch).
+		double readPixelsMs = 0;
+		/// Wall time: Create → after FP/FN stats (excludes printf / Destroy).
+		double passWallMs = 0;
+	};
+
+	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort,
+	                    BenchPrintStyle printStyle) -> AccBenchPassResult {
+		const auto tPassWall0 = std::chrono::steady_clock::now();
 		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
 		moc->SetResolution((unsigned)fbW, (unsigned)fbH);
 		moc->SetNearClipPlane(fps.cam().projection().distance);
@@ -951,22 +1095,33 @@ int main(int argc, char **argv) {
 			if (!MeshIsDrawable(mesh))
 				continue;
 			Matr4f mvp = o.model * vp;
-			MrMatrToColumnMajorGl(mvp, mvpCol);
-			std::vector<float> clipVerts(mesh.positions.size() * 4);
-			MaskedOcclusionCulling::TransformVertices(
-			    mvpCol,
-			    &mesh.positions[0].x,
-			    clipVerts.data(),
-			    (unsigned)mesh.positions.size(),
-			    MaskedOcclusionCulling::VertexLayout(12, 4, 8));
-			MaskedOcclusionCulling::CullingResult r = moc->TestTriangles(
-			    clipVerts.data(),
-			    mesh.indices.data(),
-			    (int)(mesh.indices.size() / 3),
-			    nullptr,
-			    MaskedOcclusionCulling::BACKFACE_CW,
-			    MaskedOcclusionCulling::CLIP_PLANE_ALL,
-			    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+			MaskedOcclusionCulling::CullingResult r = MaskedOcclusionCulling::VIEW_CULLED;
+			if (mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect) {
+				Vec3f wc[8];
+				ObjectWorldCorners(o, wc);
+				float rx0, ry0, rx1, ry1, rwMin;
+				if (TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin))
+					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
+				else
+					r = MaskedOcclusionCulling::VIEW_CULLED;
+			} else {
+				MrMatrToColumnMajorGl(mvp, mvpCol);
+				std::vector<float> clipVerts(mesh.positions.size() * 4);
+				MaskedOcclusionCulling::TransformVertices(
+				    mvpCol,
+				    &mesh.positions[0].x,
+				    clipVerts.data(),
+				    (unsigned)mesh.positions.size(),
+				    MaskedOcclusionCulling::VertexLayout(12, 4, 8));
+				r = moc->TestTriangles(
+				    clipVerts.data(),
+				    mesh.indices.data(),
+				    (int)(mesh.indices.size() / 3),
+				    nullptr,
+				    MaskedOcclusionCulling::BACKFACE_CW,
+				    MaskedOcclusionCulling::CLIP_PLANE_ALL,
+				    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+			}
 			mocTested[i] = 1;
 			mocRaw[i] = r;
 			if (r == MaskedOcclusionCulling::VISIBLE) {
@@ -978,6 +1133,7 @@ int main(int argc, char **argv) {
 		const double mocQueryMs =
 		    std::chrono::duration<double, std::milli>(tMocQuery1 - tMocQuery0).count();
 
+		const auto tGpuRef0 = std::chrono::steady_clock::now();
 		glViewport(0, 0, fbW, fbH);
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 		const GLuint clearZ[4] = {0, 0, 0, 0};
@@ -1011,11 +1167,18 @@ int main(int argc, char **argv) {
 		}
 		CheckGl("draw");
 		glFinish();
+		const auto tGpuDraw1 = std::chrono::steady_clock::now();
+		const double gpuRefMs =
+		    std::chrono::duration<double, std::milli>(tGpuDraw1 - tGpuRef0).count();
 
 		std::vector<unsigned> pixels((size_t)fbW * (size_t)fbH * 4);
+		const auto tReadPx0 = std::chrono::steady_clock::now();
 		glReadBuffer(GL_COLOR_ATTACHMENT0);
 		glReadPixels(0, 0, fbW, fbH, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
 		CheckGl("readpixels");
+		const auto tReadPx1 = std::chrono::steady_clock::now();
+		const double readPixelsMs =
+		    std::chrono::duration<double, std::milli>(tReadPx1 - tReadPx0).count();
 
 		std::unordered_set<uint32_t> uniq;
 		for (size_t p = 0; p < pixels.size(); p += 4) {
@@ -1039,6 +1202,23 @@ int main(int argc, char **argv) {
 			if (!mocVis[i] && gpuVis[i])
 				++fn;
 		}
+
+		const auto tPassWall1 = std::chrono::steady_clock::now();
+		const double passWallMs =
+		    std::chrono::duration<double, std::milli>(tPassWall1 - tPassWall0).count();
+
+		AccBenchPassResult result;
+		result.nAll = nAll;
+		result.nFrustum = nFrustum;
+		result.nMocVisible = nMocVisible;
+		result.nGpuVisible = nGpuVisible;
+		result.fp = fp;
+		result.fn = fn;
+		result.mocBufferMs = mocBufferMs;
+		result.mocQueryMs = mocQueryMs;
+		result.gpuRefMs = gpuRefMs;
+		result.readPixelsMs = readPixelsMs;
+		result.passWallMs = passWallMs;
 
 		if (printStyle == BenchPrintStyle::Full) {
 			Vec3f camPos = fps.cam().position();
@@ -1083,32 +1263,42 @@ int main(int argc, char **argv) {
 			}
 
 			printf("\n--- AccuracyBench (MaskedOcclusionCulling vs RGBA32UI id in .a) ---\n");
-			printf("Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f\n",
-			    fbW, fbH, USE_D3D, nearP);
-			printf("1) All objects:              %u\n", nAll);
-			printf("2) AABB in frustum:          %u\n", nFrustum);
-			printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", nMocVisible);
-			printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", nGpuVisible);
+			printf(
+			    "Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f  "
+			    "moc-test=%s (ACCURACYBENCH_MOC_TEST or --moc-test=)\n",
+			    fbW, fbH, USE_D3D, nearP,
+			    mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect ? "aabb" : "mesh");
+			printf("1) All objects:              %u\n", result.nAll);
+			printf("2) AABB in frustum:          %u\n", result.nFrustum);
+			printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", result.nMocVisible);
+			printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", result.nGpuVisible);
 			printf(
 			    "5) MOC hierarchical-Z build (clear + sort + RenderTriangles): %.3f ms\n",
-			    mocBufferMs);
+			    result.mocBufferMs);
 			printf(
-			    "6) MOC occlusion queries (TransformVertices + TestTriangles): %.3f ms\n",
-			    mocQueryMs);
+			    "6) MOC occlusion queries (%s): %.3f ms\n",
+			    mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect
+			        ? "TestRect from world AABB (edges clipped to w=min clip plane)"
+			        : "TransformVertices + TestTriangles per object",
+			    result.mocQueryMs);
+			printf(
+			    "7) GPU draw (FBO clear + buffer upload + draw + glFinish): %.3f ms\n",
+			    result.gpuRefMs);
+			printf("8) glReadPixels (RGBA32UI readback for benchmark): %.3f ms\n", result.readPixelsMs);
+			printf(
+			    "9) Full benchmark pass wall (Create → FP/FN stats; incl. frustum + pixel scan): %.3f ms\n",
+			    result.passWallMs);
+			printf("10) Sum of 5)+6)+7)+8) (sequential stages): %.3f ms\n",
+			    result.mocBufferMs + result.mocQueryMs + result.gpuRefMs + result.readPixelsMs);
 			printf("--- errors (frustum subset only) ---\n");
-			printf("False positives (MOC visible, GPU no pixel): %u\n", fp);
-			printf("False negatives (MOC occluded/culled, GPU pixel): %u\n", fn);
+			printf("False positives (MOC visible, GPU no pixel): %u\n", result.fp);
+			printf("False negatives (MOC occluded/culled, GPU pixel): %u\n", result.fn);
 			printf("(Conservative culling should avoid false negatives; a non-zero count means mismatch.)\n");
 			fflush(stdout);
-		} else {
-			std::fprintf(stderr,
-			    "\rACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
-			    "5)mocBuf=%.3fms  6)mocQry=%.3fms\033[K",
-			    nAll, nFrustum, nMocVisible, nGpuVisible, mocBufferMs, mocQueryMs);
-			std::fflush(stderr);
 		}
 
 		MaskedOcclusionCulling::Destroy(moc);
+		return result;
 	};
 
 	Matr4f vpBench = fps.viewProj();
@@ -1118,8 +1308,8 @@ int main(int argc, char **argv) {
 	if (!headless) {
 		printf("\nInteractive preview: WASD + Space/Z, Shift sprint, mouse look, scroll = move speed; "
 		       "P = print pose; 1–6,0 = scene camera presets.\n");
-		printf("Live stats on stderr: 1)–4) counts + 5)–6) MOC buffer / query CPU time (ms), every frame "
-		       "(full MOC+GPU readback pass).\n");
+		printf("Live stats on stderr: counts + MOC build / query + GPU draw + readPixels + pass wall + "
+		       "full GUI frame (ms), every iteration.\n");
 		printf("Close the window to quit.\n");
 		fflush(stdout);
 	}
@@ -1213,7 +1403,8 @@ int main(int argc, char **argv) {
 				glfwSetWindowShouldClose(win, GLFW_TRUE);
 
 			Matr4f vp = fps.viewProj();
-			runBenchmarkPass(vp, fps.cam().position(), BenchPrintStyle::LiveFour);
+			const auto tGuiFrame0 = std::chrono::steady_clock::now();
+			AccBenchPassResult br = runBenchmarkPass(vp, fps.cam().position(), BenchPrintStyle::LiveFour);
 			float mvpCol[16];
 
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1254,6 +1445,16 @@ int main(int argc, char **argv) {
 			}
 			CheckGl("preview draw");
 			glfwSwapBuffers(win);
+			const auto tGuiFrame1 = std::chrono::steady_clock::now();
+			const double guiFrameMs =
+			    std::chrono::duration<double, std::milli>(tGuiFrame1 - tGuiFrame0).count();
+			std::fprintf(stderr,
+			    "\rACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
+			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
+			    "10)guiFrame=%.3fms\033[K",
+			    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, br.mocBufferMs, br.mocQueryMs,
+			    br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
+			std::fflush(stderr);
 		}
 		std::fprintf(stderr, "\n");
 	}
