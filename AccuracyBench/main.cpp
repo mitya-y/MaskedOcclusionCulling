@@ -601,6 +601,20 @@ static bool TryLoadPathViaMrImporter(const char *path, std::vector<SceneObject> 
 }
 #endif
 
+static bool ParsePositiveFloatArg(const char *s, float &out, const char *flagName) {
+	char *end = nullptr;
+	out = std::strtof(s, &end);
+	if (end == s || *end != '\0') {
+		std::fprintf(stderr, "%s requires a single floating-point value.\n", flagName);
+		return false;
+	}
+	if (!(out > 0.f) || out >= 1e9f) {
+		std::fprintf(stderr, "%s must be a positive finite value (suggested range 1e-6 … 1e8).\n", flagName);
+		return false;
+	}
+	return true;
+}
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
@@ -608,6 +622,8 @@ int main(int argc, char **argv) {
 	const char *cameraSpec = nullptr;
 	int fbW = 1280;
 	int fbH = 720;
+	float clipNear = 0.01f;
+	float clipFar = 1000.f;
 	for (int i = 1; i < argc; ++i) {
 		if (!std::strcmp(argv[i], "--headless")) {
 			headless = true;
@@ -655,6 +671,34 @@ int main(int argc, char **argv) {
 				return 1;
 			}
 			cameraSpec = argv[++i];
+			continue;
+		}
+		if (!std::strncmp(argv[i], "--near=", 7)) {
+			if (!ParsePositiveFloatArg(argv[i] + 7, clipNear, "--near="))
+				return 1;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--near")) {
+			if (i + 1 >= argc) {
+				std::fprintf(stderr, "--near requires a value.\n");
+				return 1;
+			}
+			if (!ParsePositiveFloatArg(argv[++i], clipNear, "--near"))
+				return 1;
+			continue;
+		}
+		if (!std::strncmp(argv[i], "--far=", 6)) {
+			if (!ParsePositiveFloatArg(argv[i] + 6, clipFar, "--far="))
+				return 1;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--far")) {
+			if (i + 1 >= argc) {
+				std::fprintf(stderr, "--far requires a value.\n");
+				return 1;
+			}
+			if (!ParsePositiveFloatArg(argv[++i], clipFar, "--far"))
+				return 1;
 			continue;
 		}
 		if (argv[i][0] != '-' && !objPath)
@@ -717,16 +761,22 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	if (!(clipFar > clipNear)) {
+		std::fprintf(stderr, "Clip planes: need --far > --near (got near=%g far=%g).\n",
+		    (double)clipNear, (double)clipFar);
+		return 1;
+	}
+
 	accbench::FpsCamera fps;
 	const float aspect0 = float(fbW) / float(fbH);
-	fps.configureProjection(aspect0);
+	fps.configureProjection(aspect0, clipNear, clipFar);
 	if (cameraSpec) {
 		std::fprintf(stderr, "Parsing --camera: %s\n", cameraSpec);
 		Vec3f cpos, cdir, cup;
 		if (!ParseCameraSpec(cameraSpec, cpos, cdir, cup))
 			return 1;
 		fps.cam() = mr::math::Camera<float>(cpos, cdir, cup);
-		fps.configureProjection(aspect0);
+		fps.configureProjection(aspect0, clipNear, clipFar);
 	}
 
 	const float nearP = fps.cam().projection().distance;
@@ -1083,7 +1133,7 @@ int main(int argc, char **argv) {
 			int winW = fbW, winH = fbH;
 			glfwGetFramebufferSize(win, &winW, &winH);
 			const float asp = winH > 0 ? float(winW) / float(winH) : aspect0;
-			fps.configureProjection(asp);
+			fps.configureProjection(asp, clipNear, clipFar);
 
 			double cx, cy;
 			glfwGetCursorPos(win, &cx, &cy);

@@ -33,10 +33,10 @@ public:
 		return *this;
 	}
 
-	void configureProjection(float aspect) {
+	void configureProjection(float aspect, float nearPlane = 0.01f, float farPlane = 1000.f) {
 		auto &pr = _cam.projection();
-		pr.distance = 0.01f;
-		pr.far = 1000.f;
+		pr.distance = nearPlane;
+		pr.far = farPlane;
 		const float fovRad = mr::Radiansf(mr::Degreesf{45.f}).value();
 		pr.width = 2.f * pr.distance * std::tan(fovRad * 0.5f);
 		pr.resize(aspect);
