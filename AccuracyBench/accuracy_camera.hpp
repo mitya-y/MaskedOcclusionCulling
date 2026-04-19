@@ -9,23 +9,22 @@ namespace accbench {
 using mr::Matr4f;
 using mr::Vec3f;
 using mr::math::Camera;
-using mr::math::Pitch;
-using mr::math::Yaw;
 
-// Mirrors mr::graphics::FPSCamera + mr::Scene projection setup (45°, near 0.01, far 1000).
+// Same control math as mr::graphics::FPSCamera (mr-graphics src/camera/camera.hpp):
+// Yaw + Pitch + Roll term to keep camera upright relative to world +Y.
 class FpsCamera {
 public:
 	Camera<float> &cam() { return _cam; }
 	const Camera<float> &cam() const { return _cam; }
 
-	// Row-vector math (mr-math): p_clip = p_world * view * proj → view * proj order.
 	Matr4f viewProj() const noexcept { return _cam.perspective() * _cam.frustum(); }
 
-	// Yaw/pitch only (world-up); avoids extra roll that fights the basis and looks "swimmy" in preview.
 	FpsCamera &turn(Vec3f delta) noexcept {
 		delta *= _sensitivity;
-		_cam += Yaw(mr::Radiansf(delta.x()));
-		_cam += Pitch(mr::Radiansf(delta.y()));
+		_cam += mr::Yaw(mr::Radiansf(delta.x()));
+		_cam += mr::Pitch(mr::Radiansf(delta.y()));
+		_cam += mr::Roll(-mr::Radiansf(std::acos(_cam.right() & mr::axis::y)) + mr::pi / 2
+		    + mr::Radiansf(delta.z()));
 		return *this;
 	}
 

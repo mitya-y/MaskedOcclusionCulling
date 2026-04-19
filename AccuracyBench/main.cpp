@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cfloat>
 #include <cstdlib>
 #include <cstdio>
@@ -746,8 +747,8 @@ int main(int argc, char **argv) {
 	}
 	glfwMakeContextCurrent(win);
 	glfwSetScrollCallback(win, ScrollCallback);
-	if (!headless)
-		glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+	// if (!headless)
+	// 	glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
 	glewExperimental = GL_TRUE;
 	if (glewInit() != GLEW_OK) {
@@ -1090,6 +1091,10 @@ int main(int argc, char **argv) {
 			if (haveCursor) {
 				dx = float(cx - lx);
 				dy = float(cy - ly);
+				// Ignore huge jumps (focus loss, first grab) so the view doesn't flip.
+				const float maxStep = 240.f;
+				if (std::fabs(dx) > maxStep || std::fabs(dy) > maxStep)
+					dx = dy = 0.f;
 			}
 			haveCursor = true;
 			lx = cx;
@@ -1102,6 +1107,7 @@ int main(int argc, char **argv) {
 			if (newSp >= minSp && newSp <= maxSp)
 				fps.speed(newSp);
 
+			// Same normalization as mr::graphics Scene::update (mouse delta / extent, minus Y for screen space).
 			Vec3f angularDelta{dx / float(std::max(winW, 1)), -dy / float(std::max(winH, 1)), 0.f};
 			fps.turn(angularDelta);
 
