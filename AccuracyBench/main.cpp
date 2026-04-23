@@ -507,6 +507,8 @@ enum class MocOccludeeTestMode {
 	AabbScreenRect,
 	/// TestRect from 26-dop in local space, projected (tighter than AABB rect, cheaper than full mesh).
 	Dop26ScreenRect,
+	/// Projected 26-dop hull triangulated in screen space and tested via TestTriangles.
+	Dop26ScreenTriangles,
 };
 
 static const char *MocTestModeName(MocOccludeeTestMode m) {
@@ -517,6 +519,8 @@ static const char *MocTestModeName(MocOccludeeTestMode m) {
 		return "aabb";
 	case MocOccludeeTestMode::Dop26ScreenRect:
 		return "dop26";
+	case MocOccludeeTestMode::Dop26ScreenTriangles:
+		return "dop26tri";
 	}
 	return "mesh";
 }
@@ -666,6 +670,126 @@ static bool TryWorldDop26ProjectToTestRect(
 	outYmax = ymax;
 	outWMinClip = wMin;
 	return true;
+}
+
+struct NdcPoint2f {
+	float x = 0.f;
+	float y = 0.f;
+};
+
+static bool TryAddUniqueNdcPoint(std::vector<NdcPoint2f> &outPts, float x, float y) {
+	const float eps2 = 1e-12f;
+	for (const NdcPoint2f &p : outPts) {
+		const float dx = p.x - x;
+		const float dy = p.y - y;
+		if (dx * dx + dy * dy <= eps2)
+			return false;
+	}
+	outPts.push_back(NdcPoint2f{x, y});
+	return true;
+}
+
+static bool TryWorldDop26ProjectToNdcPoints(
+    const std::vector<accbench::dop26::Dop3f> &localVerts,
+    const std::vector<std::pair<std::uint16_t, std::uint16_t>> &edges,
+    const Matr4f &model, const Matr4f &viewProj, std::vector<NdcPoint2f> &outNdc, float &outWMinClip) {
+	outNdc.clear();
+	outWMinClip = FLT_MAX;
+	if (localVerts.empty())
+		return false;
+	const float wClip = 1e-4f;
+	std::vector<Vec4f> clip(localVerts.size());
+	for (std::size_t i = 0; i < localVerts.size(); ++i) {
+		Vec3f p{localVerts[i].x, localVerts[i].y, localVerts[i].z};
+		Vec4f h = p * model;
+		Vec3f wP{h.x(), h.y(), h.z()};
+		clip[i] = Vec4f{wP.x(), wP.y(), wP.z(), 1.f} * viewProj;
+	}
+	auto consider = [&](const Vec4f &p) {
+		const float w = p.w();
+		if (w < wClip)
+			return;
+		const float iw = 1.f / w;
+		(void)TryAddUniqueNdcPoint(outNdc, p.x() * iw, p.y() * iw);
+		outWMinClip = std::min(outWMinClip, w);
+	};
+
+	for (const Vec4f &c : clip)
+		consider(c);
+	for (const auto &e : edges) {
+		if (e.first >= clip.size() || e.second >= clip.size())
+			continue;
+		const Vec4f &a = clip[e.first];
+		const Vec4f &b = clip[e.second];
+		const float wa = a.w();
+		const float wb = b.w();
+		const float denom = wb - wa;
+		if (std::fabs(denom) < 1e-30f)
+			continue;
+		const float t = (wClip - wa) / denom;
+		if (t > 0.f && t < 1.f)
+			consider(ClipEdgePointAtW(a, b, wClip));
+	}
+	return outNdc.size() >= 1 && outWMinClip < FLT_MAX;
+}
+
+static float Cross2D(const NdcPoint2f &o, const NdcPoint2f &a, const NdcPoint2f &b) {
+	return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+static bool BuildConvexHull2D(const std::vector<NdcPoint2f> &points, std::vector<NdcPoint2f> &outHull) {
+	outHull.clear();
+	if (points.size() < 3)
+		return false;
+	std::vector<NdcPoint2f> sorted = points;
+	std::sort(sorted.begin(), sorted.end(), [](const NdcPoint2f &a, const NdcPoint2f &b) {
+		return (a.x < b.x) || (a.x == b.x && a.y < b.y);
+	});
+	std::vector<NdcPoint2f> h;
+	h.reserve(sorted.size() * 2);
+	for (const NdcPoint2f &p : sorted) {
+		while (h.size() >= 2 && Cross2D(h[h.size() - 2], h[h.size() - 1], p) <= 0.f)
+			h.pop_back();
+		h.push_back(p);
+	}
+	const std::size_t lowerSize = h.size();
+	for (std::size_t i = sorted.size(); i-- > 0;) {
+		const NdcPoint2f &p = sorted[i];
+		while (h.size() > lowerSize && Cross2D(h[h.size() - 2], h[h.size() - 1], p) <= 0.f)
+			h.pop_back();
+		h.push_back(p);
+	}
+	if (h.size() <= 3)
+		return false;
+	h.pop_back();
+	if (h.size() < 3)
+		return false;
+	outHull.swap(h);
+	return true;
+}
+
+static bool BuildClipFanFromHull(
+    const std::vector<NdcPoint2f> &hull, float wRef, std::vector<float> &outClipVerts,
+    std::vector<unsigned> &outTris) {
+	outClipVerts.clear();
+	outTris.clear();
+	if (hull.size() < 3)
+		return false;
+	const float wSafe = std::max(wRef, 1e-4f);
+	outClipVerts.reserve(hull.size() * 4);
+	for (const NdcPoint2f &p : hull) {
+		outClipVerts.push_back(p.x * wSafe);
+		outClipVerts.push_back(p.y * wSafe);
+		outClipVerts.push_back(0.f);
+		outClipVerts.push_back(wSafe);
+	}
+	outTris.reserve((hull.size() - 2) * 3);
+	for (unsigned i = 1; i + 1 < (unsigned)hull.size(); ++i) {
+		outTris.push_back(0u);
+		outTris.push_back(i);
+		outTris.push_back(i + 1u);
+	}
+	return outTris.size() >= 3;
 }
 
 static float DepthKey(const Vec3f &worldCenter, const Vec3f &camPos) {
@@ -828,9 +952,11 @@ int main(int argc, char **argv) {
 			mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
 		else if (StrEqIgnoreCaseAscii(mocTestEnv, "dop26"))
 			mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenRect;
+		else if (StrEqIgnoreCaseAscii(mocTestEnv, "dop26tri"))
+			mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenTriangles;
 		else if (!StrEqIgnoreCaseAscii(mocTestEnv, "mesh")) {
 			std::fprintf(stderr,
-			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', or 'dop26' (got '%s'); using mesh.\n",
+			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', 'dop26', or 'dop26tri' (got '%s'); using mesh.\n",
 			    mocTestEnv);
 		}
 	}
@@ -843,10 +969,13 @@ int main(int argc, char **argv) {
 				mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
 			else if (!std::strcmp(v, "dop26"))
 				mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenRect;
+			else if (!std::strcmp(v, "dop26tri"))
+				mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenTriangles;
 			else {
 				std::fprintf(stderr,
-				    "--moc-test= expects 'mesh', 'aabb', or 'dop26' (TestTriangles; TestRect from "
-				    "AABB; TestRect from 26-dop in NDC).\n");
+				    "--moc-test= expects 'mesh', 'aabb', 'dop26', or 'dop26tri' "
+				    "(TestTriangles full mesh; TestRect from AABB; TestRect from 26-dop in NDC; "
+				    "2D hull fan triangles from projected 26-dop).\n");
 				return 1;
 			}
 			continue;
@@ -1225,6 +1354,52 @@ int main(int argc, char **argv) {
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
 				else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
+			} else if (mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenTriangles) {
+				bool usedTriangles = false;
+				if (!mesh.dop26LocalVerts.empty()) {
+					std::vector<NdcPoint2f> ndcPoints;
+					float wRef = FLT_MAX;
+					if (TryWorldDop26ProjectToNdcPoints(
+					        mesh.dop26LocalVerts, mesh.dop26Edges, o.model, vp, ndcPoints, wRef)) {
+						std::vector<NdcPoint2f> hull;
+						if (BuildConvexHull2D(ndcPoints, hull)) {
+							std::vector<float> clipVerts;
+							std::vector<unsigned> triIdx;
+							if (BuildClipFanFromHull(hull, wRef, clipVerts, triIdx)) {
+								r = moc->TestTriangles(
+								    clipVerts.data(),
+								    triIdx.data(),
+								    (int)(triIdx.size() / 3),
+								    nullptr,
+								    MaskedOcclusionCulling::BACKFACE_NONE,
+								    MaskedOcclusionCulling::CLIP_PLANE_ALL,
+								    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+								usedTriangles = true;
+							}
+						}
+					}
+				}
+				if (!usedTriangles) {
+					float rx0, ry0, rx1, ry1, rwMin;
+					bool got = false;
+					if (mesh.dop26LocalVerts.empty()) {
+						Vec3f wc[8];
+						ObjectWorldCorners(o, wc);
+						got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
+					} else {
+						got = TryWorldDop26ProjectToTestRect(
+						    mesh.dop26LocalVerts, mesh.dop26Edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
+						if (!got) {
+							Vec3f wc[8];
+							ObjectWorldCorners(o, wc);
+							got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
+						}
+					}
+					if (got)
+						r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
+					else
+						r = MaskedOcclusionCulling::VIEW_CULLED;
+				}
 			} else {
 				MrMatrToColumnMajorGl(mvp, mvpCol);
 				std::vector<float> clipVerts(mesh.positions.size() * 4);
@@ -1401,6 +1576,8 @@ int main(int argc, char **argv) {
 			        ? "TestRect from world AABB (edges clipped to w=min clip plane)"
 			    : mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenRect
 			        ? "TestRect from 26-dop in NDC (Bartz 13 dir.; w-clip on edges) or AABB if no DOP"
+			    : mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenTriangles
+			        ? "Projected 26-dop to NDC point cloud; convex hull fan via TestTriangles (fallback TestRect)"
 			        : "TransformVertices + TestTriangles per object",
 			    result.mocQueryMs);
 			printf(
