@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -28,6 +29,7 @@
 #include "cgltf.h"
 
 #include "accuracy_camera.hpp"
+#include "dop26.hpp"
 #include "usd_load.hpp"
 #if ACCBENCH_HAVE_MR_IMPORTER
 #include "mr_import_usd.hpp"
@@ -38,6 +40,7 @@
 namespace {
 
 using mr::Matr4f;
+using mr::Norm3f;
 using mr::PackedVec3f;
 using mr::Vec3f;
 using mr::Vec4f;
@@ -176,6 +179,9 @@ struct Mesh {
 	std::vector<unsigned int> indices;
 	PackedVec3f aabbMin{};
 	PackedVec3f aabbMax{};
+	/// Local 26-dop (Bartz directions); empty if not built or degenerate.
+	std::vector<accbench::dop26::Dop3f> dop26LocalVerts;
+	std::vector<std::pair<std::uint16_t, std::uint16_t>> dop26Edges;
 };
 
 struct SceneObject {
@@ -202,6 +208,15 @@ static void MeshComputeAabb(Mesh &m) {
 		ExpandAabb(m.aabbMin, m.aabbMax, p);
 }
 
+static void MeshComputeDop26(Mesh &m) {
+	m.dop26LocalVerts.clear();
+	m.dop26Edges.clear();
+	if (m.positions.empty())
+		return;
+	accbench::dop26::BuildDop26FromVertexPositions(
+	    &m.positions[0].x, m.positions.size(), sizeof(PackedVec3f), m.dop26LocalVerts, m.dop26Edges);
+}
+
 static Mesh MakeUnitCube() {
 	Mesh mesh;
 	const float v[8][3] = {
@@ -217,6 +232,7 @@ static Mesh MakeUnitCube() {
 	for (unsigned i : idx)
 		mesh.indices.push_back(i);
 	MeshComputeAabb(mesh);
+	MeshComputeDop26(mesh);
 	return mesh;
 }
 
@@ -263,6 +279,7 @@ static bool LoadObjMeshes(const char *path, std::vector<SceneObject> &out) {
 			obj.mesh->indices.push_back(remap[vi]);
 		}
 		MeshComputeAabb(*obj.mesh);
+		MeshComputeDop26(*obj.mesh);
 		if (!obj.mesh->indices.empty())
 			out.push_back(std::move(obj));
 	}
@@ -361,6 +378,7 @@ static bool LoadGltfMeshes(const char *path, std::vector<SceneObject> &out) {
 				}
 
 				MeshComputeAabb(*built);
+				MeshComputeDop26(*built);
 				if (built->indices.empty())
 					continue;
 				primMeshes.emplace(primKey, built);
@@ -487,7 +505,21 @@ enum class MocOccludeeTestMode {
 	Mesh,
 	/// TestRect on NDC bounds of the world AABB (fast; more false positives vs GPU).
 	AabbScreenRect,
+	/// TestRect from 26-dop in local space, projected (tighter than AABB rect, cheaper than full mesh).
+	Dop26ScreenRect,
 };
+
+static const char *MocTestModeName(MocOccludeeTestMode m) {
+	switch (m) {
+	case MocOccludeeTestMode::Mesh:
+		return "mesh";
+	case MocOccludeeTestMode::AabbScreenRect:
+		return "aabb";
+	case MocOccludeeTestMode::Dop26ScreenRect:
+		return "dop26";
+	}
+	return "mesh";
+}
 
 static Vec4f ClipEdgePointAtW(const Vec4f &a, const Vec4f &b, float wTarget) {
 	float wa = a.w(), wb = b.w();
@@ -562,6 +594,70 @@ static bool TryWorldAabbProjectToTestRect(
 			consider(ClipEdgePointAtW(a, b, wClip));
 	}
 
+	if (!have)
+		return false;
+	outXmin = xmin;
+	outXmax = xmax;
+	outYmin = ymin;
+	outYmax = ymax;
+	outWMinClip = wMin;
+	return true;
+}
+
+static bool TryWorldDop26ProjectToTestRect(
+    const std::vector<accbench::dop26::Dop3f> &localVerts,
+    const std::vector<std::pair<std::uint16_t, std::uint16_t>> &edges,
+    const Matr4f &model, const Matr4f &viewProj, float &outXmin, float &outYmin, float &outXmax,
+    float &outYmax, float &outWMinClip) {
+	if (localVerts.empty())
+		return false;
+	const float wClip = 1e-4f;
+	std::vector<Vec4f> clip(localVerts.size());
+	for (std::size_t i = 0; i < localVerts.size(); ++i) {
+		Vec3f p{localVerts[i].x, localVerts[i].y, localVerts[i].z};
+		Vec4f h = p * model;
+		Vec3f wP{h.x(), h.y(), h.z()};
+		clip[i] = Vec4f{wP.x(), wP.y(), wP.z(), 1.f} * viewProj;
+	}
+
+	float xmin = 0.f, xmax = 0.f, ymin = 0.f, ymax = 0.f, wMin = FLT_MAX;
+	bool have = false;
+	auto consider = [&](const Vec4f &p) {
+		float w = p.w();
+		if (w < wClip)
+			return;
+		float iw = 1.f / w;
+		float nx = p.x() * iw;
+		float ny = p.y() * iw;
+		if (!have) {
+			xmin = xmax = nx;
+			ymin = ymax = ny;
+			wMin = w;
+			have = true;
+		} else {
+			xmin = std::min(xmin, nx);
+			xmax = std::max(xmax, nx);
+			ymin = std::min(ymin, ny);
+			ymax = std::max(ymax, ny);
+			wMin = std::min(wMin, w);
+		}
+	};
+
+	for (const auto &c : clip)
+		consider(c);
+	for (const auto &e : edges) {
+		if (e.first >= clip.size() || e.second >= clip.size())
+			continue;
+		const Vec4f &a = clip[e.first];
+		const Vec4f &b = clip[e.second];
+		float wa = a.w(), wb = b.w();
+		float denom = wb - wa;
+		if (std::fabs(denom) < 1e-30f)
+			continue;
+		float t = (wClip - wa) / denom;
+		if (t > 0.f && t < 1.f)
+			consider(ClipEdgePointAtW(a, b, wClip));
+	}
 	if (!have)
 		return false;
 	outXmin = xmin;
@@ -671,6 +767,7 @@ static bool FillObjectsFromUsd(std::vector<accbench::usd::MeshBuffers> &umb,
 			m->positions.push_back(PackedVec3f{p[0], p[1], p[2]});
 		m->indices = std::move(umb[mi].indices);
 		MeshComputeAabb(*m);
+		MeshComputeDop26(*m);
 		meshByIdx[mi] = std::move(m);
 	}
 	for (const auto &inst : uinst) {
@@ -729,9 +826,11 @@ int main(int argc, char **argv) {
 	if (mocTestEnv && mocTestEnv[0]) {
 		if (StrEqIgnoreCaseAscii(mocTestEnv, "aabb"))
 			mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
+		else if (StrEqIgnoreCaseAscii(mocTestEnv, "dop26"))
+			mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenRect;
 		else if (!StrEqIgnoreCaseAscii(mocTestEnv, "mesh")) {
 			std::fprintf(stderr,
-			    "ACCURACYBENCH_MOC_TEST: expected 'mesh' or 'aabb' (got '%s'); using mesh.\n",
+			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', or 'dop26' (got '%s'); using mesh.\n",
 			    mocTestEnv);
 		}
 	}
@@ -742,10 +841,12 @@ int main(int argc, char **argv) {
 				mocOccludeeTest = MocOccludeeTestMode::Mesh;
 			else if (!std::strcmp(v, "aabb"))
 				mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
+			else if (!std::strcmp(v, "dop26"))
+				mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenRect;
 			else {
 				std::fprintf(stderr,
-				    "--moc-test= expects 'mesh' or 'aabb' (full mesh TestTriangles vs "
-				    "TestRect from world AABB in NDC).\n");
+				    "--moc-test= expects 'mesh', 'aabb', or 'dop26' (TestTriangles; TestRect from "
+				    "AABB; TestRect from 26-dop in NDC).\n");
 				return 1;
 			}
 			continue;
@@ -900,7 +1001,7 @@ int main(int argc, char **argv) {
 		Vec3f cpos, cdir, cup;
 		if (!ParseCameraSpec(cameraSpec, cpos, cdir, cup))
 			return 1;
-		fps.cam() = mr::math::Camera<float>(cpos, cdir, cup);
+		fps.cam() = mr::math::Camera<float>(cpos, cdir.normalized_unchecked(), cup.normalized_unchecked());
 		fps.configureProjection(aspect0, clipNear, clipFar);
 	}
 
@@ -1104,6 +1205,26 @@ int main(int argc, char **argv) {
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
 				else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
+			} else if (mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenRect) {
+				float rx0, ry0, rx1, ry1, rwMin;
+				bool got = false;
+				if (mesh.dop26LocalVerts.empty()) {
+					Vec3f wc[8];
+					ObjectWorldCorners(o, wc);
+					got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
+				} else {
+					got = TryWorldDop26ProjectToTestRect(
+					    mesh.dop26LocalVerts, mesh.dop26Edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
+					if (!got) {
+						Vec3f wc[8];
+						ObjectWorldCorners(o, wc);
+						got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
+					}
+				}
+				if (got)
+					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
+				else
+					r = MaskedOcclusionCulling::VIEW_CULLED;
 			} else {
 				MrMatrToColumnMajorGl(mvp, mvpCol);
 				std::vector<float> clipVerts(mesh.positions.size() * 4);
@@ -1266,11 +1387,10 @@ int main(int argc, char **argv) {
 			printf(
 			    "Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f  "
 			    "moc-test=%s (ACCURACYBENCH_MOC_TEST or --moc-test=)\n",
-			    fbW, fbH, USE_D3D, nearP,
-			    mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect ? "aabb" : "mesh");
+			    fbW, fbH, USE_D3D, nearP, MocTestModeName(mocOccludeeTest));
 			printf("1) All objects:              %u\n", result.nAll);
 			printf("2) AABB in frustum:          %u\n", result.nFrustum);
-			printf("3) MOC TestTriangles VISIBLE (subset of frustum): %u\n", result.nMocVisible);
+			printf("3) MOC VISIBLE (occludee test; frustum subset): %u\n", result.nMocVisible);
 			printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", result.nGpuVisible);
 			printf(
 			    "5) MOC hierarchical-Z build (clear + sort + RenderTriangles): %.3f ms\n",
@@ -1279,6 +1399,8 @@ int main(int argc, char **argv) {
 			    "6) MOC occlusion queries (%s): %.3f ms\n",
 			    mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect
 			        ? "TestRect from world AABB (edges clipped to w=min clip plane)"
+			    : mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenRect
+			        ? "TestRect from 26-dop in NDC (Bartz 13 dir.; w-clip on edges) or AABB if no DOP"
 			        : "TransformVertices + TestTriangles per object",
 			    result.mocQueryMs);
 			printf(
@@ -1380,24 +1502,24 @@ int main(int argc, char **argv) {
 				    p.x(), p.y(), p.z(), d.x(), d.y(), d.z(), u.x(), u.y(), u.z());
 			}
 			if (edge(GLFW_KEY_1, k1))
-				fps.cam() = mr::math::Camera<float>(Vec3f{1, 1, 1}, Vec3f{-1, -1, -1}, Vec3f{0, 1, 0});
+				fps.cam() = mr::math::Camera<float>(Vec3f{1, 1, 1}, Norm3f{-1, -1, -1}, Norm3f{0, 1, 0});
 			if (edge(GLFW_KEY_2, k2))
-				fps.cam() = mr::math::Camera<float>(Vec3f{10, 10, 10}, Vec3f{-1, -1, -1}, Vec3f{0, 1, 0});
+				fps.cam() = mr::math::Camera<float>(Vec3f{10, 10, 10}, Norm3f{-1, -1, -1}, Norm3f{0, 1, 0});
 			if (edge(GLFW_KEY_3, k3))
-				fps.cam() = mr::math::Camera<float>(Vec3f{100, 100, 100}, Vec3f{-1, -1, -1}, Vec3f{0, 1, 0});
+				fps.cam() = mr::math::Camera<float>(Vec3f{100, 100, 100}, Norm3f{-1, -1, -1}, Norm3f{0, 1, 0});
 			if (edge(GLFW_KEY_4, k4))
-				fps.cam() = mr::math::Camera<float>(Vec3f{500, 500, 500}, Vec3f{-1, -1, -1}, Vec3f{0, 1, 0});
+				fps.cam() = mr::math::Camera<float>(Vec3f{500, 500, 500}, Norm3f{-1, -1, -1}, Norm3f{0, 1, 0});
 			if (edge(GLFW_KEY_5, k5))
 				fps.cam() =
-				    mr::math::Camera<float>(Vec3f{10000, 10000, 10000}, Vec3f{-1, -1, -1}, Vec3f{0, 1, 0});
+				    mr::math::Camera<float>(Vec3f{10000, 10000, 10000}, Norm3f{-1, -1, -1}, Norm3f{0, 1, 0});
 			if (edge(GLFW_KEY_6, k6))
 				fps.cam() = mr::math::Camera<float>(
-				    Vec3f{100000, 100000, 100000}, Vec3f{-1, -1, -1}, Vec3f{0, 1, 0});
+				    Vec3f{100000, 100000, 100000}, Norm3f{-1, -1, -1}, Norm3f{0, 1, 0});
 			if (edge(GLFW_KEY_0, k0)) {
 				Vec3f cp = fps.cam().position();
 				auto nd = cp.normalized();
 				if (nd)
-					fps.cam() = mr::math::Camera<float>(cp, -Vec3f(*nd), Vec3f{0, 1, 0});
+					fps.cam() = mr::math::Camera<float>(cp, -(*nd), Norm3f{0, 1, 0});
 			}
 			if (edge(GLFW_KEY_ESCAPE, kEsc))
 				glfwSetWindowShouldClose(win, GLFW_TRUE);

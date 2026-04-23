@@ -7,6 +7,7 @@
 namespace accbench {
 
 using mr::Matr4f;
+using mr::Norm3f;
 using mr::Vec3f;
 using mr::math::Camera;
 
@@ -51,8 +52,8 @@ public:
 private:
 	Camera<float> _cam{
 	    Vec3f{1.f, 1.f, 1.f},
-	    Vec3f{-1.f, -1.f, -1.f},
-	    Vec3f{0.f, 1.f, 0.f},
+	    Norm3f{-1.f, -1.f, -1.f},
+	    Norm3f{0.f, 1.f, 0.f},
 	};
 	float _speed = 0.01f;
 	float _sensitivity = 1.f;

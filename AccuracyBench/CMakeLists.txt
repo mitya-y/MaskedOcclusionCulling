@@ -177,6 +177,7 @@ target_compile_definitions(MaskedOcclusionCulling PRIVATE USE_D3D=0)
 
 add_executable(AccuracyBench
 	main.cpp
+	dop26.cpp
 	cgltf_impl.cpp
 	usd_load.cpp
 )
