@@ -5,4 +5,5 @@ AccuracyBench/build/*
 assets/*
 AccuracyBench/CMakeUserPresets.json
 build-ab/*
+.cursor/
 

@@ -1693,6 +1693,19 @@ int main(int argc, char **argv) {
 			fflush(stdout);
 		}
 
+		/// Same one-line summary as the interactive preview loop (stderr), for headless --max-frames= batching.
+		/// No GUI in this path; 10)guiFrame= is 0.0. Omit when not headless so the window path does not double-print.
+		if (headless && maxFramesLimit > 0) {
+			const double guiFrameMs = 0.0;
+			std::fprintf(stderr,
+			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
+			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
+			    "10)guiFrame=%.3fms\n",
+			    result.nAll, result.nFrustum, result.nMocVisible, result.nGpuVisible, result.mocBufferMs, result.mocQueryMs,
+			    result.gpuRefMs, result.readPixelsMs, result.passWallMs, guiFrameMs);
+			std::fflush(stderr);
+		}
+
 		MaskedOcclusionCulling::Destroy(moc);
 		return result;
 	};
