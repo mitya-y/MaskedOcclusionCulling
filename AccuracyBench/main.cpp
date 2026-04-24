@@ -57,6 +57,16 @@ static bool StrEqIgnoreCaseAscii(const char *a, const char *b) {
 	return *a == *b;
 }
 
+static bool StrPrefEqIgnoreCaseAscii(const char *s, const char *pre) {
+	for (; *pre; ++s, ++pre) {
+		if (!*s)
+			return false;
+		if (std::tolower((unsigned char)*s) != std::tolower((unsigned char)*pre))
+			return false;
+	}
+	return true;
+}
+
 static bool ParseResolutionSpec(const char *spec, int &outW, int &outH) {
 	if (!spec || !*spec)
 		return false;
@@ -174,14 +184,18 @@ static Matr4f Matr4FromColumnMajor(const float *cm) {
 	};
 }
 
+struct MeshDopLocal {
+	std::vector<accbench::dop26::Dop3f> localVerts;
+	std::vector<std::pair<std::uint16_t, std::uint16_t>> edges;
+};
+
 struct Mesh {
 	std::vector<PackedVec3f> positions;
 	std::vector<unsigned int> indices;
 	PackedVec3f aabbMin{};
 	PackedVec3f aabbMax{};
-	/// Local 26-dop (Bartz directions); empty if not built or degenerate.
-	std::vector<accbench::dop26::Dop3f> dop26LocalVerts;
-	std::vector<std::pair<std::uint16_t, std::uint16_t>> dop26Edges;
+	/// Built on demand per k (10…30, even) for MOC DOP test modes.
+	mutable std::unordered_map<int, MeshDopLocal> dopByK;
 };
 
 struct SceneObject {
@@ -208,13 +222,15 @@ static void MeshComputeAabb(Mesh &m) {
 		ExpandAabb(m.aabbMin, m.aabbMax, p);
 }
 
-static void MeshComputeDop26(Mesh &m) {
-	m.dop26LocalVerts.clear();
-	m.dop26Edges.clear();
-	if (m.positions.empty())
+static void EnsureMeshDopK(const Mesh &m, int k) {
+	if (m.positions.empty() || !accbench::dop26::IsSupportedDopK(k))
 		return;
-	accbench::dop26::BuildDop26FromVertexPositions(
-	    &m.positions[0].x, m.positions.size(), sizeof(PackedVec3f), m.dop26LocalVerts, m.dop26Edges);
+	if (m.dopByK.find(k) != m.dopByK.end())
+		return;
+	MeshDopLocal built;
+	accbench::dop26::BuildDopKFromVertexPositions(
+	    &m.positions[0].x, m.positions.size(), sizeof(PackedVec3f), k, built.localVerts, built.edges);
+	m.dopByK.emplace(k, std::move(built));
 }
 
 static Mesh MakeUnitCube() {
@@ -232,7 +248,6 @@ static Mesh MakeUnitCube() {
 	for (unsigned i : idx)
 		mesh.indices.push_back(i);
 	MeshComputeAabb(mesh);
-	MeshComputeDop26(mesh);
 	return mesh;
 }
 
@@ -279,7 +294,6 @@ static bool LoadObjMeshes(const char *path, std::vector<SceneObject> &out) {
 			obj.mesh->indices.push_back(remap[vi]);
 		}
 		MeshComputeAabb(*obj.mesh);
-		MeshComputeDop26(*obj.mesh);
 		if (!obj.mesh->indices.empty())
 			out.push_back(std::move(obj));
 	}
@@ -378,7 +392,6 @@ static bool LoadGltfMeshes(const char *path, std::vector<SceneObject> &out) {
 				}
 
 				MeshComputeAabb(*built);
-				MeshComputeDop26(*built);
 				if (built->indices.empty())
 					continue;
 				primMeshes.emplace(primKey, built);
@@ -505,24 +518,78 @@ enum class MocOccludeeTestMode {
 	Mesh,
 	/// TestRect on NDC bounds of the world AABB (fast; more false positives vs GPU).
 	AabbScreenRect,
-	/// TestRect from 26-dop in local space, projected (tighter than AABB rect, cheaper than full mesh).
-	Dop26ScreenRect,
-	/// Projected 26-dop hull triangulated in screen space and tested via TestTriangles.
-	Dop26ScreenTriangles,
+	/// TestRect from k-dop in local space, projected (tighter than AABB rect, cheaper than full mesh).
+	DopKScreenRect,
+	/// Projected k-dop hull triangulated in screen space and tested via TestTriangles.
+	DopKScreenTriangles,
 };
 
-static const char *MocTestModeName(MocOccludeeTestMode m) {
+static std::string MocTestModeLabel(MocOccludeeTestMode m, int dopK) {
 	switch (m) {
 	case MocOccludeeTestMode::Mesh:
 		return "mesh";
 	case MocOccludeeTestMode::AabbScreenRect:
 		return "aabb";
-	case MocOccludeeTestMode::Dop26ScreenRect:
-		return "dop26";
-	case MocOccludeeTestMode::Dop26ScreenTriangles:
-		return "dop26tri";
+	case MocOccludeeTestMode::DopKScreenRect: {
+		char b[32];
+		std::snprintf(b, sizeof b, "dop%d", dopK);
+		return b;
+	}
+	case MocOccludeeTestMode::DopKScreenTriangles: {
+		char b[32];
+		std::snprintf(b, sizeof b, "dop%dtri", dopK);
+		return b;
+	}
 	}
 	return "mesh";
+}
+
+/// `dop26` / `dop<k>` / `dop<k>tri` with even k in 10…30 (see dop26::IsSupportedDopK).
+static bool ParseMocTestString(const char *v, MocOccludeeTestMode &outMode, int &outDopK) {
+	if (!v)
+		return false;
+	if (StrEqIgnoreCaseAscii(v, "mesh")) {
+		outMode = MocOccludeeTestMode::Mesh;
+		return true;
+	}
+	if (StrEqIgnoreCaseAscii(v, "aabb")) {
+		outMode = MocOccludeeTestMode::AabbScreenRect;
+		return true;
+	}
+	if (StrEqIgnoreCaseAscii(v, "dop26")) {
+		outMode = MocOccludeeTestMode::DopKScreenRect;
+		outDopK = 26;
+		return true;
+	}
+	if (StrEqIgnoreCaseAscii(v, "dop26tri")) {
+		outMode = MocOccludeeTestMode::DopKScreenTriangles;
+		outDopK = 26;
+		return true;
+	}
+	if (!StrPrefEqIgnoreCaseAscii(v, "dop"))
+		return false;
+	const char *r = v + 3;
+	std::size_t nlen = std::strlen(r);
+	if (nlen == 0)
+		return false;
+	bool tri = false;
+	if (nlen >= 3 && StrEqIgnoreCaseAscii(r + nlen - 3, "tri")) {
+		tri = true;
+		nlen -= 3;
+	}
+	if (nlen == 0)
+		return false;
+	char *endp = nullptr;
+	long k = std::strtol(r, &endp, 10);
+	if (endp != r + static_cast<std::ptrdiff_t>(nlen))
+		return false;
+	if (k < 10 || k > 30 || (k & 1) != 0)
+		return false;
+	if (!accbench::dop26::IsSupportedDopK((int)k))
+		return false;
+	outDopK = (int)k;
+	outMode = tri ? MocOccludeeTestMode::DopKScreenTriangles : MocOccludeeTestMode::DopKScreenRect;
+	return true;
 }
 
 static Vec4f ClipEdgePointAtW(const Vec4f &a, const Vec4f &b, float wTarget) {
@@ -891,7 +958,6 @@ static bool FillObjectsFromUsd(std::vector<accbench::usd::MeshBuffers> &umb,
 			m->positions.push_back(PackedVec3f{p[0], p[1], p[2]});
 		m->indices = std::move(umb[mi].indices);
 		MeshComputeAabb(*m);
-		MeshComputeDop26(*m);
 		meshByIdx[mi] = std::move(m);
 	}
 	for (const auto &inst : uinst) {
@@ -936,6 +1002,21 @@ static bool ParsePositiveFloatArg(const char *s, float &out, const char *flagNam
 	return true;
 }
 
+static bool ParseMaxFramesArg(const char *s, int &out, const char *flagName) {
+	char *end = nullptr;
+	unsigned long v = std::strtoul(s, &end, 10);
+	if (end == s || *end != '\0') {
+		std::fprintf(stderr, "%s requires a positive integer.\n", flagName);
+		return false;
+	}
+	if (v < 1ul || v > 1000000ul) {
+		std::fprintf(stderr, "%s must be in range 1..1000000.\n", flagName);
+		return false;
+	}
+	out = (int)v;
+	return true;
+}
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
@@ -945,37 +1026,28 @@ int main(int argc, char **argv) {
 	int fbH = 720;
 	float clipNear = 0.01f;
 	float clipFar = 1000.f;
+	/// 0: default (unbounded preview; headless: single benchmark pass).  N>0: see --max-frames=.
+	int maxFramesLimit = 0;
 	MocOccludeeTestMode mocOccludeeTest = MocOccludeeTestMode::Mesh;
+	int mocDopK = 26;
 	const char *mocTestEnv = std::getenv("ACCURACYBENCH_MOC_TEST");
 	if (mocTestEnv && mocTestEnv[0]) {
-		if (StrEqIgnoreCaseAscii(mocTestEnv, "aabb"))
-			mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
-		else if (StrEqIgnoreCaseAscii(mocTestEnv, "dop26"))
-			mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenRect;
-		else if (StrEqIgnoreCaseAscii(mocTestEnv, "dop26tri"))
-			mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenTriangles;
-		else if (!StrEqIgnoreCaseAscii(mocTestEnv, "mesh")) {
+		if (!ParseMocTestString(mocTestEnv, mocOccludeeTest, mocDopK)) {
 			std::fprintf(stderr,
-			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', 'dop26', or 'dop26tri' (got '%s'); using mesh.\n",
+			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', 'dop<k>', or 'dop<k>tri' "
+			    "with even k in 10…30 (got '%s'); using mesh.\n",
 			    mocTestEnv);
+			mocOccludeeTest = MocOccludeeTestMode::Mesh;
 		}
 	}
 	for (int i = 1; i < argc; ++i) {
 		if (!std::strncmp(argv[i], "--moc-test=", 11)) {
 			const char *v = argv[i] + 11;
-			if (!std::strcmp(v, "mesh"))
-				mocOccludeeTest = MocOccludeeTestMode::Mesh;
-			else if (!std::strcmp(v, "aabb"))
-				mocOccludeeTest = MocOccludeeTestMode::AabbScreenRect;
-			else if (!std::strcmp(v, "dop26"))
-				mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenRect;
-			else if (!std::strcmp(v, "dop26tri"))
-				mocOccludeeTest = MocOccludeeTestMode::Dop26ScreenTriangles;
-			else {
+			if (!ParseMocTestString(v, mocOccludeeTest, mocDopK)) {
 				std::fprintf(stderr,
-				    "--moc-test= expects 'mesh', 'aabb', 'dop26', or 'dop26tri' "
-				    "(TestTriangles full mesh; TestRect from AABB; TestRect from 26-dop in NDC; "
-				    "2D hull fan triangles from projected 26-dop).\n");
+				    "--moc-test= expects 'mesh', 'aabb', 'dop<k>', or 'dop<k>tri' with even k in "
+				    "10…30 (TestTriangles full mesh; TestRect from AABB; TestRect from k-dop in NDC; "
+				    "2D hull fan from projected k-dop). Legacy aliases: dop26, dop26tri.\n");
 				return 1;
 			}
 			continue;
@@ -1053,6 +1125,21 @@ int main(int argc, char **argv) {
 				return 1;
 			}
 			if (!ParsePositiveFloatArg(argv[++i], clipFar, "--far"))
+				return 1;
+			continue;
+		}
+		// "--max-frames=" is 13 bytes; n must be 13 or strncmp also compares first digit to '\0' → no match.
+		if (!std::strncmp(argv[i], "--max-frames=", 13)) {
+			if (!ParseMaxFramesArg(argv[i] + 13, maxFramesLimit, "--max-frames="))
+				return 1;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--max-frames")) {
+			if (i + 1 >= argc) {
+				std::fprintf(stderr, "--max-frames requires a positive integer.\n");
+				return 1;
+			}
+			if (!ParseMaxFramesArg(argv[++i], maxFramesLimit, "--max-frames"))
 				return 1;
 			continue;
 		}
@@ -1334,16 +1421,21 @@ int main(int argc, char **argv) {
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
 				else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
-			} else if (mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenRect) {
+			} else if (mocOccludeeTest == MocOccludeeTestMode::DopKScreenRect) {
+				EnsureMeshDopK(mesh, mocDopK);
+				const MeshDopLocal *dop = nullptr;
+				auto dk = mesh.dopByK.find(mocDopK);
+				if (dk != mesh.dopByK.end() && !dk->second.localVerts.empty())
+					dop = &dk->second;
 				float rx0, ry0, rx1, ry1, rwMin;
 				bool got = false;
-				if (mesh.dop26LocalVerts.empty()) {
+				if (!dop) {
 					Vec3f wc[8];
 					ObjectWorldCorners(o, wc);
 					got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
 				} else {
 					got = TryWorldDop26ProjectToTestRect(
-					    mesh.dop26LocalVerts, mesh.dop26Edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
+					    dop->localVerts, dop->edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
 					if (!got) {
 						Vec3f wc[8];
 						ObjectWorldCorners(o, wc);
@@ -1354,13 +1446,18 @@ int main(int argc, char **argv) {
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
 				else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
-			} else if (mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenTriangles) {
+			} else if (mocOccludeeTest == MocOccludeeTestMode::DopKScreenTriangles) {
+				EnsureMeshDopK(mesh, mocDopK);
+				const MeshDopLocal *dop = nullptr;
+				auto dk = mesh.dopByK.find(mocDopK);
+				if (dk != mesh.dopByK.end() && !dk->second.localVerts.empty())
+					dop = &dk->second;
 				bool usedTriangles = false;
-				if (!mesh.dop26LocalVerts.empty()) {
+				if (dop) {
 					std::vector<NdcPoint2f> ndcPoints;
 					float wRef = FLT_MAX;
 					if (TryWorldDop26ProjectToNdcPoints(
-					        mesh.dop26LocalVerts, mesh.dop26Edges, o.model, vp, ndcPoints, wRef)) {
+					        dop->localVerts, dop->edges, o.model, vp, ndcPoints, wRef)) {
 						std::vector<NdcPoint2f> hull;
 						if (BuildConvexHull2D(ndcPoints, hull)) {
 							std::vector<float> clipVerts;
@@ -1382,13 +1479,13 @@ int main(int argc, char **argv) {
 				if (!usedTriangles) {
 					float rx0, ry0, rx1, ry1, rwMin;
 					bool got = false;
-					if (mesh.dop26LocalVerts.empty()) {
+					if (!dop) {
 						Vec3f wc[8];
 						ObjectWorldCorners(o, wc);
 						got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
 					} else {
 						got = TryWorldDop26ProjectToTestRect(
-						    mesh.dop26LocalVerts, mesh.dop26Edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
+						    dop->localVerts, dop->edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
 						if (!got) {
 							Vec3f wc[8];
 							ObjectWorldCorners(o, wc);
@@ -1562,7 +1659,7 @@ int main(int argc, char **argv) {
 			printf(
 			    "Resolution %dx%d  MOC USE_D3D=%d (see MaskedOcclusionCulling.h)  near=%.2f  "
 			    "moc-test=%s (ACCURACYBENCH_MOC_TEST or --moc-test=)\n",
-			    fbW, fbH, USE_D3D, nearP, MocTestModeName(mocOccludeeTest));
+			    fbW, fbH, USE_D3D, nearP, MocTestModeLabel(mocOccludeeTest, mocDopK).c_str());
 			printf("1) All objects:              %u\n", result.nAll);
 			printf("2) AABB in frustum:          %u\n", result.nFrustum);
 			printf("3) MOC VISIBLE (occludee test; frustum subset): %u\n", result.nMocVisible);
@@ -1574,10 +1671,10 @@ int main(int argc, char **argv) {
 			    "6) MOC occlusion queries (%s): %.3f ms\n",
 			    mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect
 			        ? "TestRect from world AABB (edges clipped to w=min clip plane)"
-			    : mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenRect
-			        ? "TestRect from 26-dop in NDC (Bartz 13 dir.; w-clip on edges) or AABB if no DOP"
-			    : mocOccludeeTest == MocOccludeeTestMode::Dop26ScreenTriangles
-			        ? "Projected 26-dop to NDC point cloud; convex hull fan via TestTriangles (fallback TestRect)"
+			    : mocOccludeeTest == MocOccludeeTestMode::DopKScreenRect
+			        ? "TestRect from k-dop in NDC (w-clip on edges) or AABB if no DOP / degenerate"
+			    : mocOccludeeTest == MocOccludeeTestMode::DopKScreenTriangles
+			        ? "Projected k-dop to NDC; convex hull fan via TestTriangles (fallback TestRect)"
 			        : "TransformVertices + TestTriangles per object",
 			    result.mocQueryMs);
 			printf(
@@ -1602,20 +1699,32 @@ int main(int argc, char **argv) {
 
 	Matr4f vpBench = fps.viewProj();
 	Vec3f camPosBench = fps.cam().position();
-	runBenchmarkPass(vpBench, camPosBench, BenchPrintStyle::Full);
+	if (headless && maxFramesLimit > 0) {
+		for (int f = 0; f < maxFramesLimit; ++f) {
+			Matr4f vpB = fps.viewProj();
+			Vec3f cpos = fps.cam().position();
+			runBenchmarkPass(vpB, cpos, f == 0 ? BenchPrintStyle::Full : BenchPrintStyle::LiveFour);
+		}
+	} else
+		runBenchmarkPass(vpBench, camPosBench, BenchPrintStyle::Full);
 
 	if (!headless) {
 		printf("\nInteractive preview: WASD + Space/Z, Shift sprint, mouse look, scroll = move speed; "
 		       "P = print pose; 1–6,0 = scene camera presets.\n");
 		printf("Live stats on stderr: counts + MOC build / query + GPU draw + readPixels + pass wall + "
 		       "full GUI frame (ms), every iteration.\n");
-		printf("Close the window to quit.\n");
+		if (maxFramesLimit > 0)
+			printf("Exiting after %d preview frame(s) (--max-frames); you can also close the window to quit early.\n",
+			    maxFramesLimit);
+		else
+			printf("Close the window to quit.\n");
 		fflush(stdout);
 	}
 
 	if (!headless) {
 		double lx = 0, ly = 0;
 		bool haveCursor = false;
+		int frameI = 0;
 		while (!glfwWindowShouldClose(win)) {
 			glfwPollEvents();
 
@@ -1748,12 +1857,15 @@ int main(int argc, char **argv) {
 			const double guiFrameMs =
 			    std::chrono::duration<double, std::milli>(tGuiFrame1 - tGuiFrame0).count();
 			std::fprintf(stderr,
-			    "\rACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
+			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
 			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
-			    "10)guiFrame=%.3fms\033[K",
+			    "10)guiFrame=%.3fms\n",
 			    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, br.mocBufferMs, br.mocQueryMs,
 			    br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
 			std::fflush(stderr);
+			++frameI;
+			if (maxFramesLimit > 0 && frameI >= maxFramesLimit)
+				break;
 		}
 		std::fprintf(stderr, "\n");
 	}
