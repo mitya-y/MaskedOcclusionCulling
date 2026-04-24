@@ -518,6 +518,8 @@ enum class MocOccludeeTestMode {
 	Mesh,
 	/// TestRect on NDC bounds of the world AABB (fast; more false positives vs GPU).
 	AabbScreenRect,
+	/// World AABB projected to NDC; convex-hull 2D fan via TestTriangles (fallback TestRect).
+	AabbScreenTriangles,
 	/// TestRect from k-dop in local space, projected (tighter than AABB rect, cheaper than full mesh).
 	DopKScreenRect,
 	/// Projected k-dop hull triangulated in screen space and tested via TestTriangles.
@@ -530,6 +532,8 @@ static std::string MocTestModeLabel(MocOccludeeTestMode m, int dopK) {
 		return "mesh";
 	case MocOccludeeTestMode::AabbScreenRect:
 		return "aabb";
+	case MocOccludeeTestMode::AabbScreenTriangles:
+		return "aabb-tri";
 	case MocOccludeeTestMode::DopKScreenRect: {
 		char b[32];
 		std::snprintf(b, sizeof b, "dop%d", dopK);
@@ -554,6 +558,10 @@ static bool ParseMocTestString(const char *v, MocOccludeeTestMode &outMode, int 
 	}
 	if (StrEqIgnoreCaseAscii(v, "aabb")) {
 		outMode = MocOccludeeTestMode::AabbScreenRect;
+		return true;
+	}
+	if (StrEqIgnoreCaseAscii(v, "aabb-tri") || StrEqIgnoreCaseAscii(v, "aabb_tri")) {
+		outMode = MocOccludeeTestMode::AabbScreenTriangles;
 		return true;
 	}
 	if (StrEqIgnoreCaseAscii(v, "dop26")) {
@@ -754,6 +762,43 @@ static bool TryAddUniqueNdcPoint(std::vector<NdcPoint2f> &outPts, float x, float
 	}
 	outPts.push_back(NdcPoint2f{x, y});
 	return true;
+}
+
+static bool TryWorldAabbProjectToNdcPoints(
+    const Vec3f worldCorners[8], const Matr4f &viewProj, std::vector<NdcPoint2f> &outNdc, float &outWMinClip) {
+	outNdc.clear();
+	outWMinClip = FLT_MAX;
+	const float wClip = 1e-4f;
+	Vec4f c[8];
+	for (int i = 0; i < 8; ++i)
+		c[i] = Vec4f{worldCorners[i].x(), worldCorners[i].y(), worldCorners[i].z(), 1.f} * viewProj;
+	static const int kEdges[12][2] = {
+	    {0, 1}, {1, 2}, {2, 3}, {3, 0},
+	    {4, 5}, {5, 6}, {6, 7}, {7, 4},
+	    {0, 4}, {1, 5}, {2, 6}, {3, 7},
+	};
+	auto consider = [&](const Vec4f &p) {
+		const float w = p.w();
+		if (w < wClip)
+			return;
+		const float iw = 1.f / w;
+		(void)TryAddUniqueNdcPoint(outNdc, p.x() * iw, p.y() * iw);
+		outWMinClip = std::min(outWMinClip, w);
+	};
+	for (int i = 0; i < 8; ++i)
+		consider(c[i]);
+	for (int e = 0; e < 12; ++e) {
+		const Vec4f &a = c[kEdges[e][0]];
+		const Vec4f &b = c[kEdges[e][1]];
+		const float wa = a.w(), wb = b.w();
+		const float denom = wb - wa;
+		if (std::fabs(denom) < 1e-30f)
+			continue;
+		const float t = (wClip - wa) / denom;
+		if (t > 0.f && t < 1.f)
+			consider(ClipEdgePointAtW(a, b, wClip));
+	}
+	return !outNdc.empty() && outWMinClip < FLT_MAX;
 }
 
 static bool TryWorldDop26ProjectToNdcPoints(
@@ -1034,7 +1079,7 @@ int main(int argc, char **argv) {
 	if (mocTestEnv && mocTestEnv[0]) {
 		if (!ParseMocTestString(mocTestEnv, mocOccludeeTest, mocDopK)) {
 			std::fprintf(stderr,
-			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', 'dop<k>', or 'dop<k>tri' "
+			    "ACCURACYBENCH_MOC_TEST: expected 'mesh', 'aabb', 'aabb-tri', 'dop<k>', or 'dop<k>tri' "
 			    "with even k in 10…30 (got '%s'); using mesh.\n",
 			    mocTestEnv);
 			mocOccludeeTest = MocOccludeeTestMode::Mesh;
@@ -1045,9 +1090,9 @@ int main(int argc, char **argv) {
 			const char *v = argv[i] + 11;
 			if (!ParseMocTestString(v, mocOccludeeTest, mocDopK)) {
 				std::fprintf(stderr,
-				    "--moc-test= expects 'mesh', 'aabb', 'dop<k>', or 'dop<k>tri' with even k in "
-				    "10…30 (TestTriangles full mesh; TestRect from AABB; TestRect from k-dop in NDC; "
-				    "2D hull fan from projected k-dop). Legacy aliases: dop26, dop26tri.\n");
+				    "--moc-test= expects 'mesh', 'aabb', 'aabb-tri', 'dop<k>', or 'dop<k>tri' with even k in "
+				    "10…30 (TestTriangles full mesh; TestRect from AABB; 2D hull from projected AABB; "
+				    "TestRect from k-dop in NDC; 2D hull fan from projected k-dop). Legacy aliases: dop26, dop26tri.\n");
 				return 1;
 			}
 			continue;
@@ -1421,6 +1466,37 @@ int main(int argc, char **argv) {
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
 				else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
+			} else if (mocOccludeeTest == MocOccludeeTestMode::AabbScreenTriangles) {
+				Vec3f wc[8];
+				ObjectWorldCorners(o, wc);
+				std::vector<NdcPoint2f> ndcPoints;
+				float wRef = FLT_MAX;
+				bool usedTriangles = false;
+				if (TryWorldAabbProjectToNdcPoints(wc, vp, ndcPoints, wRef)) {
+					std::vector<NdcPoint2f> hull;
+					if (BuildConvexHull2D(ndcPoints, hull)) {
+						std::vector<float> clipVerts;
+						std::vector<unsigned> triIdx;
+						if (BuildClipFanFromHull(hull, wRef, clipVerts, triIdx)) {
+							r = moc->TestTriangles(
+							    clipVerts.data(),
+							    triIdx.data(),
+							    (int)(triIdx.size() / 3),
+							    nullptr,
+							    MaskedOcclusionCulling::BACKFACE_NONE,
+							    MaskedOcclusionCulling::CLIP_PLANE_ALL,
+							    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+							usedTriangles = true;
+						}
+					}
+				}
+				if (!usedTriangles) {
+					float rx0, ry0, rx1, ry1, rwMin;
+					if (TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin))
+						r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
+					else
+						r = MaskedOcclusionCulling::VIEW_CULLED;
+				}
 			} else if (mocOccludeeTest == MocOccludeeTestMode::DopKScreenRect) {
 				EnsureMeshDopK(mesh, mocDopK);
 				const MeshDopLocal *dop = nullptr;
@@ -1671,6 +1747,8 @@ int main(int argc, char **argv) {
 			    "6) MOC occlusion queries (%s): %.3f ms\n",
 			    mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect
 			        ? "TestRect from world AABB (edges clipped to w=min clip plane)"
+			    : mocOccludeeTest == MocOccludeeTestMode::AabbScreenTriangles
+			        ? "World AABB to NDC; convex hull 2D fan via TestTriangles (fallback TestRect)"
 			    : mocOccludeeTest == MocOccludeeTestMode::DopKScreenRect
 			        ? "TestRect from k-dop in NDC (w-clip on edges) or AABB if no DOP / degenerate"
 			    : mocOccludeeTest == MocOccludeeTestMode::DopKScreenTriangles

@@ -5,7 +5,7 @@ Batch-run AccuracyBench: fixed list of (model, camera, clip), × dop k.
 Default: --headless --max-frames=30; last ACCBench line = stabilized metrics.
 
 CSV: scene_name, bound, camera, all, frustum, mocVis, gpuIds, mocBuf, mocQry, gpuDraw.
-bound = "aabb" (dop_k=0) or "dop<K>"; scene_name = "<id>_<bound>".
+bound: dop_k=0 -> aabb; dop_k=1 -> aabb-tri; else dop<K> (maps to moc flags as in C++). scene_name = "<id>_<bound>".
 Failed runs not written; errors only on stderr.
 
   ./batch_accbench.py --bench ./build/Release/AccuracyBench \\
@@ -121,10 +121,10 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true", help="Print commands only")
     args = p.parse_args()
 
-    dop_ks: list[int] = [0]
+    dop_ks: list[int] = [0, 1]
     k = args.dop_min
     while k <= args.dop_max:
-        if k != 0:
+        if k not in (0, 1):
             dop_ks.append(k)
         k += args.dop_step
 
@@ -152,8 +152,12 @@ def main() -> int:
         for camera_index, s in enumerate(BENCH_SCENES):
             model = resolve_model_path(s, args.assets_base)
             for dop_k in dop_ks:
-                moc = f"dop{dop_k}tri" if dop_k > 0 else "aabb"
-                bound = f"dop{dop_k}" if dop_k > 0 else "aabb"
+                if dop_k == 0:
+                    moc, bound = "aabb", "aabb"
+                elif dop_k == 1:
+                    moc, bound = "aabb-tri", "aabb-tri"
+                else:
+                    moc, bound = f"dop{dop_k}tri", f"dop{dop_k}"
                 argv: list[str] = [str(args.bench)]
                 if args.headless:
                     argv.append("--headless")
