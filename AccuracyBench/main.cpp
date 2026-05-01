@@ -129,6 +129,38 @@ void main() {
 }
 )";
 
+const char *kLineWorldVertSrc = R"(#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+void main() {
+	gl_Position = uMVP * vec4(aPos, 1.0);
+}
+)";
+
+const char *kLineWorldFragSrc = R"(#version 330 core
+uniform vec3 uColor;
+out vec4 FragColor;
+void main() {
+	FragColor = vec4(uColor, 1.0);
+}
+)";
+
+const char *kOverlayNdcVertSrc = R"(#version 330 core
+layout(location = 0) in vec2 aNdc;
+void main() {
+	gl_Position = vec4(aNdc.xy, 0.0, 1.0);
+}
+)";
+
+const char *kOverlayNdcFragSrc = R"(#version 330 core
+uniform vec3 uColor;
+uniform float uAlpha;
+out vec4 FragColor;
+void main() {
+	FragColor = vec4(uColor, uAlpha);
+}
+)";
+
 static void CheckGl(const char *where) {
 	GLenum e = glGetError();
 	if (e != GL_NO_ERROR)
@@ -155,6 +187,26 @@ static GLuint LinkProgram(GLuint vs, GLuint fs) {
 	glAttachShader(p, vs);
 	glAttachShader(p, fs);
 	glBindAttribLocation(p, 0, "aPos");
+	glLinkProgram(p);
+	GLint ok = 0;
+	glGetProgramiv(p, GL_LINK_STATUS, &ok);
+	if (!ok) {
+		char buf[2048];
+		glGetProgramInfoLog(p, sizeof(buf), nullptr, buf);
+		fprintf(stderr, "Program link failed:\n%s\n", buf);
+		exit(1);
+	}
+	glDeleteShader(vs);
+	glDeleteShader(fs);
+	return p;
+}
+
+/// Like `LinkProgram` but attrib location 0 is bound to `attrib0Name` (for overlay line shaders).
+static GLuint LinkProgramAttrib0(GLuint vs, GLuint fs, const char *attrib0Name) {
+	GLuint p = glCreateProgram();
+	glAttachShader(p, vs);
+	glAttachShader(p, fs);
+	glBindAttribLocation(p, 0, attrib0Name);
 	glLinkProgram(p);
 	GLint ok = 0;
 	glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -987,6 +1039,181 @@ static bool ParseCameraSpec(const char *s, Vec3f &outPos, Vec3f &outDir, Vec3f &
 	return true;
 }
 
+/// Same 12 edges as `TryWorldAabbProjectToTestRect` corner order from `ObjectWorldCorners`.
+static const int kWorldAabbEdges[12][2] = {
+    {0, 1}, {1, 2}, {2, 3}, {3, 0},
+    {4, 5}, {5, 6}, {6, 7}, {7, 4},
+    {0, 4}, {1, 5}, {2, 6}, {3, 7},
+};
+
+/*!
+ * Fills line geometry for `--visualize-bounds` / `--visualize-bound-projection`.
+ * Branches mirror `runBenchmarkPass` occludee test (same fallbacks).
+ */
+static void FillOccludeeBoundOverlay(
+    const SceneObject &o,
+    const Mesh &mesh,
+    MocOccludeeTestMode mode,
+    int mocDopK,
+    const Matr4f &vp,
+    bool fillWorld,
+    bool fillNdc,
+    std::vector<Vec3f> &outWorldSegPairs,
+    bool &outHasNdc,
+    bool &outNdcIsRect,
+    float &outRx0,
+    float &outRy0,
+    float &outRx1,
+    float &outRy1,
+    std::vector<NdcPoint2f> &outNdcHull) {
+	outWorldSegPairs.clear();
+	outHasNdc = false;
+	outNdcIsRect = false;
+	outNdcHull.clear();
+
+	if (fillWorld) {
+		if (mode == MocOccludeeTestMode::AabbScreenRect || mode == MocOccludeeTestMode::AabbScreenTriangles) {
+			Vec3f wc[8];
+			ObjectWorldCorners(o, wc);
+			for (int e = 0; e < 12; ++e) {
+				outWorldSegPairs.push_back(wc[kWorldAabbEdges[e][0]]);
+				outWorldSegPairs.push_back(wc[kWorldAabbEdges[e][1]]);
+			}
+		} else if (mode != MocOccludeeTestMode::Mesh) {
+			EnsureMeshDopK(mesh, mocDopK);
+			const MeshDopLocal *dop = nullptr;
+			auto dk = mesh.dopByK.find(mocDopK);
+			if (dk != mesh.dopByK.end() && !dk->second.localVerts.empty())
+				dop = &dk->second;
+			if (!dop) {
+				Vec3f wc[8];
+				ObjectWorldCorners(o, wc);
+				for (int e = 0; e < 12; ++e) {
+					outWorldSegPairs.push_back(wc[kWorldAabbEdges[e][0]]);
+					outWorldSegPairs.push_back(wc[kWorldAabbEdges[e][1]]);
+				}
+			} else {
+				for (const auto &edge : dop->edges) {
+					if (edge.first >= dop->localVerts.size() || edge.second >= dop->localVerts.size())
+						continue;
+					for (int k = 0; k < 2; ++k) {
+						const auto &lv = k == 0 ? dop->localVerts[edge.first] : dop->localVerts[edge.second];
+						Vec3f pl{lv.x, lv.y, lv.z};
+						Vec4f h = pl * o.model;
+						outWorldSegPairs.push_back(Vec3f{h.x(), h.y(), h.z()});
+					}
+				}
+			}
+		}
+	}
+
+	if (!fillNdc)
+		return;
+
+	if (mode == MocOccludeeTestMode::AabbScreenRect) {
+		Vec3f wc[8];
+		ObjectWorldCorners(o, wc);
+		float rwMin = 0.f;
+		if (TryWorldAabbProjectToTestRect(wc, vp, outRx0, outRy0, outRx1, outRy1, rwMin)) {
+			(void)rwMin;
+			outHasNdc = true;
+			outNdcIsRect = true;
+		}
+	} else if (mode == MocOccludeeTestMode::AabbScreenTriangles) {
+		Vec3f wc[8];
+		ObjectWorldCorners(o, wc);
+		std::vector<NdcPoint2f> ndcPoints;
+		float wRef = FLT_MAX;
+		bool usedHull = false;
+		if (TryWorldAabbProjectToNdcPoints(wc, vp, ndcPoints, wRef)) {
+			std::vector<NdcPoint2f> hull;
+			if (BuildConvexHull2D(ndcPoints, hull)) {
+				outNdcHull = std::move(hull);
+				outHasNdc = true;
+				outNdcIsRect = false;
+				usedHull = true;
+			}
+		}
+		if (!usedHull) {
+			float rwMin = 0.f;
+			if (TryWorldAabbProjectToTestRect(wc, vp, outRx0, outRy0, outRx1, outRy1, rwMin)) {
+				(void)rwMin;
+				outHasNdc = true;
+				outNdcIsRect = true;
+			}
+		}
+	} else if (mode == MocOccludeeTestMode::DopKScreenRect) {
+		EnsureMeshDopK(mesh, mocDopK);
+		const MeshDopLocal *dop = nullptr;
+		auto dk = mesh.dopByK.find(mocDopK);
+		if (dk != mesh.dopByK.end() && !dk->second.localVerts.empty())
+			dop = &dk->second;
+		float rwMin = 0.f;
+		bool got = false;
+		if (!dop) {
+			Vec3f wc[8];
+			ObjectWorldCorners(o, wc);
+			got = TryWorldAabbProjectToTestRect(wc, vp, outRx0, outRy0, outRx1, outRy1, rwMin);
+		} else {
+			got = TryWorldDop26ProjectToTestRect(
+			    dop->localVerts, dop->edges, o.model, vp, outRx0, outRy0, outRx1, outRy1, rwMin);
+			if (!got) {
+				Vec3f wc[8];
+				ObjectWorldCorners(o, wc);
+				got = TryWorldAabbProjectToTestRect(wc, vp, outRx0, outRy0, outRx1, outRy1, rwMin);
+			}
+		}
+		if (got) {
+			(void)rwMin;
+			outHasNdc = true;
+			outNdcIsRect = true;
+		}
+	} else if (mode == MocOccludeeTestMode::DopKScreenTriangles) {
+		EnsureMeshDopK(mesh, mocDopK);
+		const MeshDopLocal *dop = nullptr;
+		auto dk = mesh.dopByK.find(mocDopK);
+		if (dk != mesh.dopByK.end() && !dk->second.localVerts.empty())
+			dop = &dk->second;
+		bool usedHull = false;
+		if (dop) {
+			std::vector<NdcPoint2f> ndcPoints;
+			float wRef = FLT_MAX;
+			if (TryWorldDop26ProjectToNdcPoints(
+			        dop->localVerts, dop->edges, o.model, vp, ndcPoints, wRef)) {
+				std::vector<NdcPoint2f> hull;
+				if (BuildConvexHull2D(ndcPoints, hull)) {
+					outNdcHull = std::move(hull);
+					outHasNdc = true;
+					outNdcIsRect = false;
+					usedHull = true;
+				}
+			}
+		}
+		if (!usedHull) {
+			float rwMin = 0.f;
+			bool got = false;
+			if (!dop) {
+				Vec3f wc[8];
+				ObjectWorldCorners(o, wc);
+				got = TryWorldAabbProjectToTestRect(wc, vp, outRx0, outRy0, outRx1, outRy1, rwMin);
+			} else {
+				got = TryWorldDop26ProjectToTestRect(
+				    dop->localVerts, dop->edges, o.model, vp, outRx0, outRy0, outRx1, outRy1, rwMin);
+				if (!got) {
+					Vec3f wc[8];
+					ObjectWorldCorners(o, wc);
+					got = TryWorldAabbProjectToTestRect(wc, vp, outRx0, outRy0, outRx1, outRy1, rwMin);
+				}
+			}
+			if (got) {
+				(void)rwMin;
+				outHasNdc = true;
+				outNdcIsRect = true;
+			}
+		}
+	}
+}
+
 } // namespace
 
 static double g_scrollAccum = 0.0;
@@ -1137,6 +1364,8 @@ int main(int argc, char **argv) {
 	int maxFramesLimit = 0;
 	/// -1: off. Else save `depthN.png` on pass index N (0-based) after MOC occluder rasterization.
 	int saveMocDepthFrame = -1;
+	bool visualizeBounds = false;
+	bool visualizeBoundProjection = false;
 	MocOccludeeTestMode mocOccludeeTest = MocOccludeeTestMode::Mesh;
 	int mocDopK = 26;
 	const char *mocTestEnv = std::getenv("ACCURACYBENCH_MOC_TEST");
@@ -1267,8 +1496,23 @@ int main(int argc, char **argv) {
 				return 1;
 			continue;
 		}
+		if (!std::strcmp(argv[i], "--visualize-bounds")) {
+			visualizeBounds = true;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--visualize-bound-projection") ||
+		    !std::strcmp(argv[i], "--visualize-bounds-projection")) {
+			visualizeBoundProjection = true;
+			continue;
+		}
 		if (argv[i][0] != '-' && !objPath)
 			objPath = argv[i];
+	}
+
+	if (headless && (visualizeBounds || visualizeBoundProjection)) {
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: --visualize-bounds / --visualize-bound-projection require the preview window; "
+		    "ignored with --headless.\n");
 	}
 
 	std::vector<SceneObject> objects;
@@ -1393,10 +1637,30 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	GLuint vao = 0, vbo = 0, ebo = 0;
+	GLuint vsLw = CompileShader(GL_VERTEX_SHADER, kLineWorldVertSrc);
+	GLuint fsLw = CompileShader(GL_FRAGMENT_SHADER, kLineWorldFragSrc);
+	GLuint progLineWorld = LinkProgram(vsLw, fsLw);
+	GLint locLineMvp = glGetUniformLocation(progLineWorld, "uMVP");
+	GLint locLineColor = glGetUniformLocation(progLineWorld, "uColor");
+	if (locLineMvp < 0 || locLineColor < 0) {
+		fprintf(stderr, "Missing bound-line shader uniforms.\n");
+		return 1;
+	}
+	GLuint vsOv = CompileShader(GL_VERTEX_SHADER, kOverlayNdcVertSrc);
+	GLuint fsOv = CompileShader(GL_FRAGMENT_SHADER, kOverlayNdcFragSrc);
+	GLuint progOverlayNdc = LinkProgramAttrib0(vsOv, fsOv, "aNdc");
+	GLint locNdcColor = glGetUniformLocation(progOverlayNdc, "uColor");
+	GLint locNdcAlpha = glGetUniformLocation(progOverlayNdc, "uAlpha");
+	if (locNdcColor < 0 || locNdcAlpha < 0) {
+		fprintf(stderr, "Missing NDC overlay uniforms (need uColor + uAlpha).\n");
+		return 1;
+	}
+
+	GLuint vao = 0, vbo = 0, ebo = 0, lineVbo = 0;
 	glGenVertexArrays(1, &vao);
 	glGenBuffers(1, &vbo);
 	glGenBuffers(1, &ebo);
+	glGenBuffers(1, &lineVbo);
 
 	GLuint fbo = 0, colorTex = 0, depthRb = 0;
 	glGenFramebuffers(1, &fbo);
@@ -1435,6 +1699,9 @@ int main(int argc, char **argv) {
 		/// Wall time: Create → after FP/FN stats (excludes printf / Destroy).
 		double passWallMs = 0;
 	};
+
+	std::vector<unsigned char> guiBenchMocVisible(objects.size(), 0);
+	std::vector<unsigned char> guiPrevMocVisibleForOverlay(objects.size(), 0);
 
 	auto runBenchmarkPass = [&](int passFrameIndex, const Matr4f &vp, const Vec3f &camPosForSort,
 	                    BenchPrintStyle printStyle) -> AccBenchPassResult {
@@ -1876,6 +2143,15 @@ int main(int argc, char **argv) {
 			std::fflush(stderr);
 		}
 
+		for (size_t pi = 0; pi < objects.size(); ++pi)
+			guiBenchMocVisible[pi] = static_cast<unsigned char>(mocVis[pi]);
+
+		// Default framebuffer must be bound for GUI preview paths; detach VAO/program so attrib 0 /
+		// draw-buffer state cannot leak after RGBA32UI FBO draws + readback.
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glBindVertexArray(0);
+		glUseProgram(0);
+
 		MaskedOcclusionCulling::Destroy(moc);
 		return result;
 	};
@@ -1908,6 +2184,10 @@ int main(int argc, char **argv) {
 	if (!headless) {
 		printf("\nInteractive preview: WASD + Space/Z, Shift sprint, mouse look, scroll = move speed; "
 		       "P = print pose; 1–6,0 = scene camera presets.\n");
+		printf(
+		    "With `--moc-test` other than mesh: `--visualize-bounds` draws k-DOP / AABB wires (green; depth-tested, "
+		    "no depth writes). `--visualize-bound-projection` draws NDC hull (yellow); alias `--visualize-bounds-projection`. "
+		    "Both only for objects MOC-visible this frame or last frame.\n");
 		printf("Live stats on stderr: counts + MOC build / query + GPU draw + readPixels + pass wall + "
 		       "full GUI frame (ms), every iteration.\n");
 		if (maxFramesLimit > 0)
@@ -1916,6 +2196,13 @@ int main(int argc, char **argv) {
 		else
 			printf("Close the window to quit.\n");
 		fflush(stdout);
+	}
+
+	if (!headless && mocOccludeeTest == MocOccludeeTestMode::Mesh &&
+	    (visualizeBounds || visualizeBoundProjection)) {
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: --visualize-bounds / --visualize-bound-projection require `--moc-test` other than "
+		    "mesh; no bound overlay will be drawn.\n");
 	}
 
 	if (!headless) {
@@ -1927,8 +2214,8 @@ int main(int argc, char **argv) {
 
 			int winW = fbW, winH = fbH;
 			glfwGetFramebufferSize(win, &winW, &winH);
-			const float asp = winH > 0 ? float(winW) / float(winH) : aspect0;
-			fps.configureProjection(asp, clipNear, clipFar);
+			// Projection matches letterboxed vw:vh ≡ fbW:fbH, not raw win buffer (scaling → VP/viewport mismatch).
+			fps.configureProjection(aspect0, clipNear, clipFar);
 
 			double cx, cy;
 			glfwGetCursorPos(win, &cx, &cy);
@@ -2050,6 +2337,139 @@ int main(int argc, char **argv) {
 				glDrawElements(GL_TRIANGLES, (GLsizei)o.mesh->indices.size(), GL_UNSIGNED_INT, nullptr);
 			}
 			CheckGl("preview draw");
+
+			if ((visualizeBounds || visualizeBoundProjection) && mocOccludeeTest != MocOccludeeTestMode::Mesh) {
+				Vec4f frustumPlanes[6];
+				FrustumPlanesMrGraphics(vp, frustumPlanes);
+				std::vector<Vec3f> worldPairs;
+				std::vector<float> wf;
+				std::vector<float> nf;
+				bool hasNdc = false;
+				bool ndcIsRect = false;
+				float rx0 = 0.f, ry0 = 0.f, rx1 = 0.f, ry1 = 0.f;
+				std::vector<NdcPoint2f> ndcHull;
+
+				glDisable(GL_BLEND);
+
+				if (visualizeBounds) {
+					glUseProgram(progLineWorld);
+					MrMatrToColumnMajorGl(vp, mvpCol);
+					glUniformMatrix4fv(locLineMvp, 1, GL_FALSE, mvpCol);
+					glBindVertexArray(vao);
+					glBindBuffer(GL_ARRAY_BUFFER, lineVbo);
+					glDisable(GL_CULL_FACE);
+					// glLineWidth is not guaranteed in Core profile; harmless if ignored.
+					glLineWidth(2.0f);
+					// Depth test + no writes: nearer mesh shading kept; omit solid bbox fill —
+					// dense instances: unrelated AABB tris win depth-per-pixel falsely -> greenwash.
+					glEnable(GL_DEPTH_TEST);
+					glDepthFunc(GL_LESS);
+					glDepthMask(GL_FALSE);
+
+					for (size_t ii = 0; ii < objects.size(); ++ii) {
+						if (!MeshIsDrawable(*objects[ii].mesh))
+							continue;
+						if (!guiBenchMocVisible[ii] && !guiPrevMocVisibleForOverlay[ii])
+							continue;
+						Vec3f wcForFrust[8];
+						ObjectWorldCorners(objects[ii], wcForFrust);
+						if (!IsWorldAabbFrustumVisibleMrGraphics(frustumPlanes, wcForFrust))
+							continue;
+
+						FillOccludeeBoundOverlay(objects[ii], *objects[ii].mesh, mocOccludeeTest, mocDopK, vp,
+						    true, false, worldPairs, hasNdc, ndcIsRect, rx0, ry0, rx1, ry1, ndcHull);
+						if (!worldPairs.empty()) {
+							glUniform3f(locLineColor, 0.28f, 0.92f, 0.42f);
+							wf.resize(worldPairs.size() * 3);
+							for (size_t j = 0; j < worldPairs.size(); ++j) {
+								wf[j * 3 + 0] = worldPairs[j].x();
+								wf[j * 3 + 1] = worldPairs[j].y();
+								wf[j * 3 + 2] = worldPairs[j].z();
+							}
+							glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(wf.size() * sizeof(float)), wf.data(),
+							    GL_STREAM_DRAW);
+							glEnableVertexAttribArray(0);
+							glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, (void *)0);
+							glDrawArrays(GL_LINES, 0, (GLsizei)(wf.size() / 3));
+						}
+					}
+					CheckGl("preview bound wires");
+				}
+				if (visualizeBoundProjection) {
+					glBindFramebuffer(GL_FRAMEBUFFER, 0);
+					glDisable(GL_DEPTH_TEST);
+					glDisable(GL_CULL_FACE);
+					glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+					glEnable(GL_BLEND);
+					glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+					glUseProgram(progOverlayNdc);
+					glUniform3f(locNdcColor, 1.0f, 0.88f, 0.12f);
+					glBindVertexArray(vao);
+					glBindBuffer(GL_ARRAY_BUFFER, lineVbo);
+					glLineWidth(2.0f);
+					for (size_t ii = 0; ii < objects.size(); ++ii) {
+						if (!MeshIsDrawable(*objects[ii].mesh))
+							continue;
+						if (!guiBenchMocVisible[ii] && !guiPrevMocVisibleForOverlay[ii])
+							continue;
+						Vec3f wcForFrust[8];
+						ObjectWorldCorners(objects[ii], wcForFrust);
+						if (!IsWorldAabbFrustumVisibleMrGraphics(frustumPlanes, wcForFrust))
+							continue;
+						FillOccludeeBoundOverlay(objects[ii], *objects[ii].mesh, mocOccludeeTest, mocDopK, vp,
+						    false, true, worldPairs, hasNdc, ndcIsRect, rx0, ry0, rx1, ry1, ndcHull);
+						if (!hasNdc)
+							continue;
+						glEnableVertexAttribArray(0);
+						glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+						if (ndcIsRect) {
+							glUniform1f(locNdcAlpha, 0.22f);
+							nf = {rx0, ry0, rx1, ry0, rx0, ry1, rx1, ry1};
+							glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(nf.size() * sizeof(float)), nf.data(),
+							    GL_STREAM_DRAW);
+							glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+							glUniform1f(locNdcAlpha, 1.0f);
+							nf = {
+							    rx0, ry0, rx1, ry0,
+							    rx1, ry0, rx1, ry1,
+							    rx1, ry1, rx0, ry1,
+							    rx0, ry1, rx0, ry0,
+							};
+							glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(nf.size() * sizeof(float)), nf.data(),
+							    GL_STREAM_DRAW);
+							glDrawArrays(GL_LINES, 0, 8);
+						} else if (ndcHull.size() >= 3) {
+							const size_t hn = ndcHull.size();
+							glUniform1f(locNdcAlpha, 0.22f);
+							nf.resize(hn * 2);
+							for (size_t j = 0; j < hn; ++j) {
+								nf[j * 2] = ndcHull[j].x;
+								nf[j * 2 + 1] = ndcHull[j].y;
+							}
+							glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(nf.size() * sizeof(float)), nf.data(),
+							    GL_STREAM_DRAW);
+							glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)hn);
+
+							glUniform1f(locNdcAlpha, 1.0f);
+							nf.resize(hn * 4);
+							for (size_t j = 0; j < hn; ++j) {
+								size_t jn = (j + 1) % hn;
+								nf[j * 4 + 0] = ndcHull[j].x;
+								nf[j * 4 + 1] = ndcHull[j].y;
+								nf[j * 4 + 2] = ndcHull[jn].x;
+								nf[j * 4 + 3] = ndcHull[jn].y;
+							}
+							glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(nf.size() * sizeof(float)), nf.data(),
+							    GL_STREAM_DRAW);
+							glDrawArrays(GL_LINES, 0, (GLsizei)(hn * 2));
+						}
+					}
+					glDisable(GL_BLEND);
+					CheckGl("preview bound NDC overlay");
+				}
+				glEnable(GL_DEPTH_TEST);
+				glDepthMask(GL_TRUE);
+			}
 			glfwSwapBuffers(win);
 			const auto tGuiFrame1 = std::chrono::steady_clock::now();
 			const double guiFrameMs =
@@ -2061,6 +2481,7 @@ int main(int argc, char **argv) {
 			    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, br.mocBufferMs, br.mocQueryMs,
 			    br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
 			std::fflush(stderr);
+			guiPrevMocVisibleForOverlay.assign(guiBenchMocVisible.begin(), guiBenchMocVisible.end());
 			++frameI;
 			if (maxFramesLimit > 0 && frameI >= maxFramesLimit)
 				break;
@@ -2073,7 +2494,10 @@ int main(int argc, char **argv) {
 	glDeleteFramebuffers(1, &fbo);
 	glDeleteBuffers(1, &vbo);
 	glDeleteBuffers(1, &ebo);
+	glDeleteBuffers(1, &lineVbo);
 	glDeleteVertexArrays(1, &vao);
+	glDeleteProgram(progOverlayNdc);
+	glDeleteProgram(progLineWorld);
 	glDeleteProgram(progPreview);
 	glDeleteProgram(prog);
 	glfwDestroyWindow(win);
