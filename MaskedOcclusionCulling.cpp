@@ -298,6 +298,7 @@ namespace MaskedOcclusionCullingSSE41
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 	#include "MaskedOcclusionCullingCommon.inl"
+	#include "MaskedOcclusionCullingFromDepth.inl"
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Utility function to create a new object using the allocator callbacks
@@ -307,6 +308,13 @@ namespace MaskedOcclusionCullingSSE41
 	{
 		MaskedOcclusionCullingPrivate *object = (MaskedOcclusionCullingPrivate *)alignedAlloc(64, sizeof(MaskedOcclusionCullingPrivate));
 		new (object) MaskedOcclusionCullingPrivate(alignedAlloc, alignedFree);
+		return object;
+	}
+
+	MaskedOcclusionCulling *CreateMaskedOcclusionCullingFromDepth(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree)
+	{
+		MaskedOcclusionCullingFromDepthPrivate *object = (MaskedOcclusionCullingFromDepthPrivate *)alignedAlloc(64, sizeof(MaskedOcclusionCullingFromDepthPrivate));
+		new (object) MaskedOcclusionCullingFromDepthPrivate(alignedAlloc, alignedFree);
 		return object;
 	}
 };
@@ -406,6 +414,7 @@ namespace MaskedOcclusionCullingSSE2
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 	#include "MaskedOcclusionCullingCommon.inl"
+	#include "MaskedOcclusionCullingFromDepth.inl"
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Utility function to create a new object using the allocator callbacks
@@ -417,6 +426,13 @@ namespace MaskedOcclusionCullingSSE2
 		new (object) MaskedOcclusionCullingPrivate(alignedAlloc, alignedFree);
 		return object;
 	}
+
+	MaskedOcclusionCulling *CreateMaskedOcclusionCullingFromDepth(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree)
+	{
+		MaskedOcclusionCullingFromDepthPrivate *object = (MaskedOcclusionCullingFromDepthPrivate *)alignedAlloc(64, sizeof(MaskedOcclusionCullingFromDepthPrivate));
+		new (object) MaskedOcclusionCullingFromDepthPrivate(alignedAlloc, alignedFree);
+		return object;
+	}
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -425,11 +441,13 @@ namespace MaskedOcclusionCullingSSE2
 namespace MaskedOcclusionCullingAVX512
 {
 	extern MaskedOcclusionCulling *CreateMaskedOcclusionCulling(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
+	extern MaskedOcclusionCulling *CreateMaskedOcclusionCullingFromDepth(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
 }
 
 namespace MaskedOcclusionCullingAVX2
 {
 	extern MaskedOcclusionCulling *CreateMaskedOcclusionCulling(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
+	extern MaskedOcclusionCulling *CreateMaskedOcclusionCullingFromDepth(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
 }
 
 MaskedOcclusionCulling *MaskedOcclusionCulling::Create(Implementation RequestedSIMD)
@@ -455,6 +473,32 @@ MaskedOcclusionCulling *MaskedOcclusionCulling::Create(Implementation RequestedS
 		object = MaskedOcclusionCullingSSE41::CreateMaskedOcclusionCulling(alignedAlloc, alignedFree); // Use SSE4.1 version
 	if (object == nullptr)
 		object = MaskedOcclusionCullingSSE2::CreateMaskedOcclusionCulling(alignedAlloc, alignedFree); // Use SSE2 (slow) version
+
+	return object;
+}
+
+MaskedOcclusionCulling *MaskedOcclusionCulling::CreateFromDepth(Implementation RequestedSIMD)
+{
+	return CreateFromDepth(RequestedSIMD, moc_aligned_alloc, moc_aligned_free);
+}
+
+MaskedOcclusionCulling *MaskedOcclusionCulling::CreateFromDepth(Implementation RequestedSIMD, pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree)
+{
+	MaskedOcclusionCulling *object = nullptr;
+
+	MaskedOcclusionCulling::Implementation impl = DetectCPUFeatures(alignedAlloc, alignedFree);
+
+	if (RequestedSIMD < impl)
+		impl = RequestedSIMD;
+
+	if (object == nullptr && impl >= AVX512)
+		object = MaskedOcclusionCullingAVX512::CreateMaskedOcclusionCullingFromDepth(alignedAlloc, alignedFree);
+	if (object == nullptr && impl >= AVX2)
+		object = MaskedOcclusionCullingAVX2::CreateMaskedOcclusionCullingFromDepth(alignedAlloc, alignedFree);
+	if (object == nullptr && impl >= SSE41)
+		object = MaskedOcclusionCullingSSE41::CreateMaskedOcclusionCullingFromDepth(alignedAlloc, alignedFree);
+	if (object == nullptr)
+		object = MaskedOcclusionCullingSSE2::CreateMaskedOcclusionCullingFromDepth(alignedAlloc, alignedFree);
 
 	return object;
 }

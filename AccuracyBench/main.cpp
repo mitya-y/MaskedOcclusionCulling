@@ -108,11 +108,26 @@ void main() {
 }
 )";
 
-const char *kFragSrc = R"(#version 330 core
+/// Reference pass: RGBA32UI id buffer + R32F clip-space w (for MOC ImportPixelDepthBuffer / 1/w).
+const char *kVertRefBenchSrc = R"(#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+out float vClipW;
+void main() {
+	vec4 clip = uMVP * vec4(aPos, 1.0);
+	gl_Position = clip;
+	vClipW = clip.w;
+}
+)";
+
+const char *kFragRefBenchSrc = R"(#version 330 core
 uniform uint uObjectId;
 layout(location = 0) out uvec4 mrt;
+layout(location = 1) out float oClipW;
+in float vClipW;
 void main() {
 	mrt = uvec4(0u, 0u, 0u, uObjectId);
+	oClipW = vClipW;
 }
 )";
 
@@ -1351,9 +1366,29 @@ static bool SaveMocHizDepthPng(MaskedOcclusionCulling *moc, int w, int h, const 
 	return true;
 }
 
+/// Read GL_COLOR_ATTACHMENT1 (R32F clip w); convert rows GL bottom-first → top-first rcpW for MOC ImportPixelDepthBuffer(..., true).
+static void AccBenchReadClipWToTopFirstRcpW(int w, int h, std::vector<float> &outTopFirstRcpW) {
+	std::vector<float> tmp((size_t)w * (size_t)h);
+	glReadBuffer(GL_COLOR_ATTACHMENT1);
+	glReadPixels(0, 0, w, h, GL_RED, GL_FLOAT, tmp.data());
+	outTopFirstRcpW.resize((size_t)w * (size_t)h);
+	for (int y = 0; y < h; y++) {
+		const float *srcRow = tmp.data() + (size_t)(h - 1 - y) * (size_t)w;
+		float *dstRow = outTopFirstRcpW.data() + (size_t)y * (size_t)w;
+		for (int x = 0; x < w; x++) {
+			const float cw = srcRow[x];
+			dstRow[x] = (std::isfinite(cw) && cw > 1e-8f) ? (1.f / cw) : 0.f;
+		}
+	}
+}
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
+	bool usePrevFramePrev = false;
+	/// When false (default): GPU id readback draws only MOC VISIBLE (+ frustum), matching typical submit.
+	/// `--gpu-draw-always`: draw all frustum for reference buffer / FN pixels (ignores MOC query outcome).
+	bool gpuDrawAlways = false;
 	const char *objPath = nullptr;
 	const char *cameraSpec = nullptr;
 	int fbW = 1280;
@@ -1505,6 +1540,14 @@ int main(int argc, char **argv) {
 			visualizeBoundProjection = true;
 			continue;
 		}
+		if (!std::strcmp(argv[i], "--use-prev-frame-prev")) {
+			usePrevFramePrev = true;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--gpu-draw-always")) {
+			gpuDrawAlways = true;
+			continue;
+		}
 		if (argv[i][0] != '-' && !objPath)
 			objPath = argv[i];
 	}
@@ -1513,6 +1556,27 @@ int main(int argc, char **argv) {
 		std::fprintf(stderr,
 		    "ACCURACYBENCH: --visualize-bounds / --visualize-bound-projection require the preview window; "
 		    "ignored with --headless.\n");
+	}
+	if (usePrevFramePrev) {
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: --use-prev-frame-prev → GPU draw all frustum first → ImportPixelDepthBuffer from clip.w "
+		    "(~1/w).\n");
+		if (!gpuDrawAlways)
+			std::fprintf(stderr,
+			    "  Default id readback: after MOC queries, second draw clears FBO and submits only MOC VISIBLE "
+			    "(culled). FN pixel metric unavailable.\n");
+		else
+			std::fprintf(stderr,
+			    "  --gpu-draw-always: same pass feeds Hi-Z Import + id readback (full frustum overdraw reference).\n");
+	}
+	if (!gpuDrawAlways && !usePrevFramePrev) {
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: default GPU reference draw = culled visible-only after MOC queries (matches typical "
+		    "submit). Use --gpu-draw-always for full frustum readback / FN pixels.\n");
+	}
+	if (gpuDrawAlways && !usePrevFramePrev) {
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: --gpu-draw-always → reference draw includes all frustum instances regardless of MOC.\n");
 	}
 
 	std::vector<SceneObject> objects;
@@ -1617,9 +1681,9 @@ int main(int argc, char **argv) {
 	}
 	glGetError();
 
-	GLuint vs = CompileShader(GL_VERTEX_SHADER, kVertSrc);
-	GLuint fs = CompileShader(GL_FRAGMENT_SHADER, kFragSrc);
-	GLuint prog = LinkProgram(vs, fs);
+	GLuint vsRef = CompileShader(GL_VERTEX_SHADER, kVertRefBenchSrc);
+	GLuint fsRef = CompileShader(GL_FRAGMENT_SHADER, kFragRefBenchSrc);
+	GLuint prog = LinkProgram(vsRef, fsRef);
 	GLint locMvp = glGetUniformLocation(prog, "uMVP");
 	GLint locId = glGetUniformLocation(prog, "uObjectId");
 	if (locMvp < 0 || locId < 0) {
@@ -1662,7 +1726,7 @@ int main(int argc, char **argv) {
 	glGenBuffers(1, &ebo);
 	glGenBuffers(1, &lineVbo);
 
-	GLuint fbo = 0, colorTex = 0, depthRb = 0;
+	GLuint fbo = 0, colorTex = 0, clipWTex = 0, depthRb = 0;
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glGenTextures(1, &colorTex);
@@ -1671,6 +1735,14 @@ int main(int argc, char **argv) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, fbW, fbH, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, nullptr);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
+	glGenTextures(1, &clipWTex);
+	glBindTexture(GL_TEXTURE_2D, clipWTex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, fbW, fbH, 0, GL_RED, GL_FLOAT, nullptr);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, clipWTex, 0);
+	const GLenum kDrawBufs[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+	glDrawBuffers(2, kDrawBufs);
 	glGenRenderbuffers(1, &depthRb);
 	glBindRenderbuffer(GL_RENDERBUFFER, depthRb);
 	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, fbW, fbH);
@@ -1690,6 +1762,8 @@ int main(int argc, char **argv) {
 		unsigned nGpuVisible = 0;
 		unsigned fp = 0;
 		unsigned fn = 0;
+		/// Frustum subset where MOC VISIBLE and GPU had ≥1 id pixel (cross-check: agree+fp=mocVis, agree+fn=gpuIds).
+		unsigned agreeVisFrustum = 0;
 		double mocBufferMs = 0;
 		double mocQueryMs = 0;
 		/// Offscreen RGBA32UI + depth: clear, upload, draw, glFinish (no readback).
@@ -1703,71 +1777,141 @@ int main(int argc, char **argv) {
 	std::vector<unsigned char> guiBenchMocVisible(objects.size(), 0);
 	std::vector<unsigned char> guiPrevMocVisibleForOverlay(objects.size(), 0);
 
+	std::vector<float> gpuClipScratchRcpW;
+
+	auto drawGpuReferenceFill = [&](const Matr4f &vp, const std::vector<char> *visibleMask) {
+		glViewport(0, 0, fbW, fbH);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		const GLuint clearZ[4] = {0, 0, 0, 0};
+		glClearBufferuiv(GL_COLOR, 0, clearZ);
+		const GLfloat clearClipW[1] = {0.f};
+		glClearBufferfv(GL_COLOR, 1, clearClipW);
+		glClearDepth(1.0);
+		glClear(GL_DEPTH_BUFFER_BIT);
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LESS);
+		glUseProgram(prog);
+		glBindVertexArray(vao);
+		float mvpColLocal[16];
+		Vec4f frustumPlanesGpu[6];
+		FrustumPlanesMrGraphics(vp, frustumPlanesGpu);
+		for (size_t i = 0; i < objects.size(); ++i) {
+			const SceneObject &o = objects[i];
+			if (!MeshIsDrawable(*o.mesh))
+				continue;
+			Vec3f wcornersGpu[8];
+			ObjectWorldCorners(o, wcornersGpu);
+			if (!IsWorldAabbFrustumVisibleMrGraphics(frustumPlanesGpu, wcornersGpu))
+				continue;
+			if (visibleMask) {
+				if (i >= visibleMask->size() || !(*visibleMask)[i])
+					continue;
+			}
+			Matr4f mvp = o.model * vp;
+			MrMatrToColumnMajorGl(mvp, mvpColLocal);
+			glUniformMatrix4fv(locMvp, 1, GL_FALSE, mvpColLocal);
+			glUniform1ui(locId, o.id);
+			glBindBuffer(GL_ARRAY_BUFFER, vbo);
+			glBufferData(GL_ARRAY_BUFFER, o.mesh->positions.size() * sizeof(PackedVec3f),
+			    o.mesh->positions.data(), GL_STREAM_DRAW);
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+			glBufferData(GL_ELEMENT_ARRAY_BUFFER, o.mesh->indices.size() * sizeof(unsigned),
+			    o.mesh->indices.data(), GL_STREAM_DRAW);
+			glEnableVertexAttribArray(0);
+			glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(PackedVec3f), (void *)0);
+			glDrawElements(GL_TRIANGLES, (GLsizei)o.mesh->indices.size(), GL_UNSIGNED_INT, nullptr);
+		}
+		CheckGl("drawGpuReferenceFill");
+	};
+
 	auto runBenchmarkPass = [&](int passFrameIndex, const Matr4f &vp, const Vec3f &camPosForSort,
 	                    BenchPrintStyle printStyle) -> AccBenchPassResult {
 		const auto tPassWall0 = std::chrono::steady_clock::now();
-		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
+		MaskedOcclusionCulling *moc = usePrevFramePrev ? MaskedOcclusionCulling::CreateFromDepth(MocImplFromEnv())
+		                                                : MaskedOcclusionCulling::Create(MocImplFromEnv());
 		moc->SetResolution((unsigned)fbW, (unsigned)fbH);
 		moc->SetNearClipPlane(fps.cam().projection().distance);
-		const auto tMocBuffer0 = std::chrono::steady_clock::now();
-		moc->ClearBuffer();
 
-		std::vector<size_t> order(objects.size());
-		for (size_t i = 0; i < order.size(); ++i)
-			order[i] = i;
-		std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-			PackedVec3f midA{
-			    (objects[a].mesh->aabbMin.x + objects[a].mesh->aabbMax.x) * 0.5f,
-			    (objects[a].mesh->aabbMin.y + objects[a].mesh->aabbMax.y) * 0.5f,
-			    (objects[a].mesh->aabbMin.z + objects[a].mesh->aabbMax.z) * 0.5f,
-			};
-			PackedVec3f midB{
-			    (objects[b].mesh->aabbMin.x + objects[b].mesh->aabbMax.x) * 0.5f,
-			    (objects[b].mesh->aabbMin.y + objects[b].mesh->aabbMax.y) * 0.5f,
-			    (objects[b].mesh->aabbMin.z + objects[b].mesh->aabbMax.z) * 0.5f,
-			};
-			Vec3f ca3{midA.x, midA.y, midA.z};
-			Vec3f cb3{midB.x, midB.y, midB.z};
-			Vec4f ha = ca3 * objects[a].model;
-			Vec4f hb = cb3 * objects[b].model;
-			Vec3f ca{ha.x(), ha.y(), ha.z()};
-			Vec3f cb{hb.x(), hb.y(), hb.z()};
-			const float da = DepthKey(ca, camPosForSort);
-			const float db = DepthKey(cb, camPosForSort);
-			if (da < db)
-				return true;
-			if (db < da)
-				return false;
-			return a < b;
-		});
+		double gpuRefMs = 0.0;
+		double mocBufferMs = 0.0;
 
 		float mvpCol[16];
-		for (size_t k : order) {
-			const SceneObject &o = objects[k];
-			const Mesh &mesh = *o.mesh;
-			if (!MeshIsDrawable(mesh))
-				continue;
-			Matr4f mvp = o.model * vp;
-			MrMatrToColumnMajorGl(mvp, mvpCol);
-			std::vector<float> clipVerts(mesh.positions.size() * 4);
-			MaskedOcclusionCulling::TransformVertices(
-			    mvpCol,
-			    &mesh.positions[0].x,
-			    clipVerts.data(),
-			    (unsigned)mesh.positions.size(),
-			    MaskedOcclusionCulling::VertexLayout(12, 4, 8));
-			moc->RenderTriangles(
-			    clipVerts.data(),
-			    mesh.indices.data(),
-			    (int)(mesh.indices.size() / 3),
-			    nullptr,
-			    MaskedOcclusionCulling::BACKFACE_CW,
-			    MaskedOcclusionCulling::CLIP_PLANE_ALL,
-			    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+
+		if (usePrevFramePrev) {
+			/// One GPU draw for this vp: same color/depth/clip.w buffer drives Import + later readPixels.
+			const auto tGpuRef0 = std::chrono::steady_clock::now();
+			drawGpuReferenceFill(vp, nullptr);
+			glFinish();
+			const auto tGpuRef1 = std::chrono::steady_clock::now();
+			gpuRefMs = std::chrono::duration<double, std::milli>(tGpuRef1 - tGpuRef0).count();
+
+			const auto tMocBuffer0 = std::chrono::steady_clock::now();
+			AccBenchReadClipWToTopFirstRcpW(fbW, fbH, gpuClipScratchRcpW);
+			moc->ClearBuffer();
+			moc->ImportPixelDepthBuffer(gpuClipScratchRcpW.data(), true);
+			const auto tMocBuffer1 = std::chrono::steady_clock::now();
+			mocBufferMs =
+			    std::chrono::duration<double, std::milli>(tMocBuffer1 - tMocBuffer0).count();
+		} else {
+			const auto tMocBuffer0 = std::chrono::steady_clock::now();
+
+			std::vector<size_t> order(objects.size());
+			for (size_t i = 0; i < order.size(); ++i)
+				order[i] = i;
+			std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+				PackedVec3f midA{
+				    (objects[a].mesh->aabbMin.x + objects[a].mesh->aabbMax.x) * 0.5f,
+				    (objects[a].mesh->aabbMin.y + objects[a].mesh->aabbMax.y) * 0.5f,
+				    (objects[a].mesh->aabbMin.z + objects[a].mesh->aabbMax.z) * 0.5f,
+				};
+				PackedVec3f midB{
+				    (objects[b].mesh->aabbMin.x + objects[b].mesh->aabbMax.x) * 0.5f,
+				    (objects[b].mesh->aabbMin.y + objects[b].mesh->aabbMax.y) * 0.5f,
+				    (objects[b].mesh->aabbMin.z + objects[b].mesh->aabbMax.z) * 0.5f,
+				};
+				Vec3f ca3{midA.x, midA.y, midA.z};
+				Vec3f cb3{midB.x, midB.y, midB.z};
+				Vec4f ha = ca3 * objects[a].model;
+				Vec4f hb = cb3 * objects[b].model;
+				Vec3f ca{ha.x(), ha.y(), ha.z()};
+				Vec3f cb{hb.x(), hb.y(), hb.z()};
+				const float da = DepthKey(ca, camPosForSort);
+				const float db = DepthKey(cb, camPosForSort);
+				if (da < db)
+					return true;
+				if (db < da)
+					return false;
+				return a < b;
+			});
+
+			moc->ClearBuffer();
+			for (size_t k : order) {
+				const SceneObject &o = objects[k];
+				const Mesh &mesh = *o.mesh;
+				if (!MeshIsDrawable(mesh))
+					continue;
+				Matr4f mvp = o.model * vp;
+				MrMatrToColumnMajorGl(mvp, mvpCol);
+				std::vector<float> clipVerts(mesh.positions.size() * 4);
+				MaskedOcclusionCulling::TransformVertices(
+				    mvpCol,
+				    &mesh.positions[0].x,
+				    clipVerts.data(),
+				    (unsigned)mesh.positions.size(),
+				    MaskedOcclusionCulling::VertexLayout(12, 4, 8));
+				moc->RenderTriangles(
+				    clipVerts.data(),
+				    mesh.indices.data(),
+				    (int)(mesh.indices.size() / 3),
+				    nullptr,
+				    MaskedOcclusionCulling::BACKFACE_CW,
+				    MaskedOcclusionCulling::CLIP_PLANE_ALL,
+				    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+			}
+			const auto tMocBuffer1 = std::chrono::steady_clock::now();
+			mocBufferMs =
+			    std::chrono::duration<double, std::milli>(tMocBuffer1 - tMocBuffer0).count();
 		}
-		const auto tMocBuffer1 = std::chrono::steady_clock::now();
-		const double mocBufferMs =
-		    std::chrono::duration<double, std::milli>(tMocBuffer1 - tMocBuffer0).count();
 
 		if (saveMocDepthFrame >= 0 && passFrameIndex == saveMocDepthFrame) {
 			char path[96];
@@ -1787,6 +1931,7 @@ int main(int argc, char **argv) {
 		unsigned nMocVisible = 0;
 		unsigned nGpuVisible = 0;
 		unsigned fp = 0, fn = 0;
+		unsigned agreeVisFrustum = 0;
 
 		std::vector<char> frustumHit(nAll, 0);
 		std::vector<char> mocVis(nAll, 0);
@@ -1961,43 +2106,19 @@ int main(int argc, char **argv) {
 		const double mocQueryMs =
 		    std::chrono::duration<double, std::milli>(tMocQuery1 - tMocQuery0).count();
 
-		const auto tGpuRef0 = std::chrono::steady_clock::now();
-		glViewport(0, 0, fbW, fbH);
-		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-		const GLuint clearZ[4] = {0, 0, 0, 0};
-		glClearBufferuiv(GL_COLOR, 0, clearZ);
-		glClearDepth(1.0);
-		glClear(GL_DEPTH_BUFFER_BIT);
-		glEnable(GL_DEPTH_TEST);
-		glDepthFunc(GL_LESS);
-		glUseProgram(prog);
-		glBindVertexArray(vao);
-
-		for (size_t i = 0; i < objects.size(); ++i) {
-			const SceneObject &o = objects[i];
-			if (!MeshIsDrawable(*o.mesh))
-				continue;
-			Matr4f mvp = o.model * vp;
-			MrMatrToColumnMajorGl(mvp, mvpCol);
-			glUniformMatrix4fv(locMvp, 1, GL_FALSE, mvpCol);
-			glUniform1ui(locId, o.id);
-
-			glBindBuffer(GL_ARRAY_BUFFER, vbo);
-			glBufferData(GL_ARRAY_BUFFER, o.mesh->positions.size() * sizeof(PackedVec3f),
-			    o.mesh->positions.data(), GL_STREAM_DRAW);
-			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-			glBufferData(GL_ELEMENT_ARRAY_BUFFER, o.mesh->indices.size() * sizeof(unsigned),
-			    o.mesh->indices.data(), GL_STREAM_DRAW);
-			glEnableVertexAttribArray(0);
-			glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(PackedVec3f), (void *)0);
-
-			glDrawElements(GL_TRIANGLES, (GLsizei)o.mesh->indices.size(), GL_UNSIGNED_INT, nullptr);
+		if (!usePrevFramePrev) {
+			const auto tGpuRef0 = std::chrono::steady_clock::now();
+			drawGpuReferenceFill(vp, gpuDrawAlways ? nullptr : &mocVis);
+			glFinish();
+			const auto tGpuDraw1 = std::chrono::steady_clock::now();
+			gpuRefMs = std::chrono::duration<double, std::milli>(tGpuDraw1 - tGpuRef0).count();
+		} else if (!gpuDrawAlways) {
+			const auto tGpuCull0 = std::chrono::steady_clock::now();
+			drawGpuReferenceFill(vp, &mocVis);
+			glFinish();
+			const auto tGpuCull1 = std::chrono::steady_clock::now();
+			gpuRefMs += std::chrono::duration<double, std::milli>(tGpuCull1 - tGpuCull0).count();
 		}
-		CheckGl("draw");
-		glFinish();
-		const auto tGpuDraw1 = std::chrono::steady_clock::now();
-		const double gpuRefMs =
-		    std::chrono::duration<double, std::milli>(tGpuDraw1 - tGpuRef0).count();
 
 		std::vector<unsigned> pixels((size_t)fbW * (size_t)fbH * 4);
 		const auto tReadPx0 = std::chrono::steady_clock::now();
@@ -2014,7 +2135,6 @@ int main(int argc, char **argv) {
 			if (id != 0)
 				uniq.insert(id);
 		}
-		nGpuVisible = (unsigned)uniq.size();
 
 		for (size_t i = 0; i < objects.size(); ++i) {
 			uint32_t id = objects[i].id;
@@ -2022,9 +2142,21 @@ int main(int argc, char **argv) {
 				gpuVis[i] = 1;
 		}
 
+		/// Match nMocVisible domain: only instances that passed world-AABB frustum test (same loop as MOC queries).
+		/// uniq.size() mixes in objects outside that AABB test but with rasterized pixels — bogus vs line 3).
+		nGpuVisible = 0;
 		for (size_t i = 0; i < objects.size(); ++i) {
 			if (!frustumHit[i])
 				continue;
+			if (gpuVis[i])
+				++nGpuVisible;
+		}
+
+		for (size_t i = 0; i < objects.size(); ++i) {
+			if (!frustumHit[i])
+				continue;
+			if (mocVis[i] && gpuVis[i])
+				++agreeVisFrustum;
 			if (mocVis[i] && !gpuVis[i])
 				++fp;
 			if (!mocVis[i] && gpuVis[i])
@@ -2042,6 +2174,7 @@ int main(int argc, char **argv) {
 		result.nGpuVisible = nGpuVisible;
 		result.fp = fp;
 		result.fn = fn;
+		result.agreeVisFrustum = agreeVisFrustum;
 		result.mocBufferMs = mocBufferMs;
 		result.mocQueryMs = mocQueryMs;
 		result.gpuRefMs = gpuRefMs;
@@ -2064,7 +2197,9 @@ int main(int argc, char **argv) {
 			    "  OpenGL: VBO = same local positions; vertex shader gl_Position = MVP * vec4(aPos,1).\n"
 			    "          Fragment shader writes uvec4(0,0,0, objectId) to RGBA32UI; depth buffer GL_LESS.\n"
 			    "  Frustum stats: same as mr-graphics — planes from viewProj().transposed() (vp[3]±vp[0..2]),\n"
-			    "          normalized; world AABB = min/max of 8 local-AABB corners * model; bounds.h-style test.\n\n");
+			    "          normalized; world AABB = min/max of 8 local-AABB corners * model; bounds.h-style test;\n"
+			    "          GPU reference draw + preview mesh skip draws when this test fails (same set as MOC queries);\n"
+			    "          default submit for id readback = MOC VISIBLE only (`--gpu-draw-always` = full frustum overdraw ref).\n\n");
 			printf("Camera pos (%.2f, %.2f, %.2f)  dir (%.2f, %.2f, %.2f)  up (%.2f, %.2f, %.2f)\n",
 			    camPos.x(), camPos.y(), camPos.z(), camDir.x(), camDir.y(), camDir.z(), camUp.x(), camUp.y(),
 			    camUp.z());
@@ -2098,9 +2233,40 @@ int main(int argc, char **argv) {
 			printf("1) All objects:              %u\n", result.nAll);
 			printf("2) AABB in frustum:          %u\n", result.nFrustum);
 			printf("3) MOC VISIBLE (occludee test; frustum subset): %u\n", result.nMocVisible);
-			printf("4) GPU unique object IDs in buffer (any pixel):   %u\n", result.nGpuVisible);
 			printf(
-			    "5) MOC hierarchical-Z build (clear + sort + RenderTriangles): %.3f ms\n",
+			    "4) GPU-visible instances (frustum AABB subset, ≥1 pixel in id readback): %u  "
+			    "(global unique ids in buffer — reference only: %zu)%s\n",
+			    result.nGpuVisible,
+			    uniq.size(),
+			    gpuDrawAlways ? "" : "  [default: culled draw — only MOC VISIBLE submitted]");
+			if (gpuDrawAlways) {
+				const int lhs = (int)result.nGpuVisible - (int)result.nMocVisible;
+				const int rhs = (int)result.fn - (int)result.fp;
+				printf(
+				    "4b) Sanity: gpuIds−mocVis should equal FN−FP → %d vs %d %s\n",
+				    lhs, rhs, lhs == rhs ? "(ok)" : "(BUG)");
+				printf(
+				    "4c) Frustum ∩ both visible: %u  (= mocVis−FP = gpuIds−FN → %u = %u)\n",
+				    result.agreeVisFrustum,
+				    result.nMocVisible - result.fp,
+				    result.nGpuVisible - result.fn);
+			} else {
+				printf(
+				    "4b) Default culled draw: occluded instances not rasterized → FN pixel metric unavailable; "
+				    "expect FN≈0, gpuIds≤mocVis if visibility gate matches.\n");
+			}
+			if (gpuDrawAlways && mocOccludeeTest != MocOccludeeTestMode::Mesh) {
+				printf(
+				    "    Proxy --moc-test: line 3 uses occludee proxy; line 4 uses mesh pixels. "
+				    "dop/AABB hull ⊂ mesh ⇒ gpuIds>mocVis normal (see FN).\n");
+			}
+			printf(
+			    "5) MOC hierarchical-Z build (%s): %.3f ms\n",
+			    usePrevFramePrev
+			        ? (gpuDrawAlways
+			              ? "readback clip.w + Import (~1/w); same pass as timed GPU draw in 7)"
+			              : "readback clip.w from pass1 (all frustum) + ImportPixelDepthBuffer (~1/w)")
+			        : "clear + sort + RenderTriangles",
 			    result.mocBufferMs);
 			printf(
 			    "6) MOC occlusion queries (%s): %.3f ms\n",
@@ -2115,7 +2281,13 @@ int main(int argc, char **argv) {
 			        : "TransformVertices + TestTriangles per object",
 			    result.mocQueryMs);
 			printf(
-			    "7) GPU draw (FBO clear + buffer upload + draw + glFinish): %.3f ms\n",
+			    !gpuDrawAlways && usePrevFramePrev
+			        ? "7) GPU draw (pass1 all frustum→clip.w Import + pass2 culled color/depth): %.3f ms\n"
+			    : !gpuDrawAlways
+			        ? "7) GPU draw (after queries: culled visible-only submit): %.3f ms\n"
+			    : usePrevFramePrev
+			        ? "7) GPU draw (single ref pass — shared id buffer + clip.w for Import): %.3f ms\n"
+			        : "7) GPU draw (FBO clear + buffer upload + draw + glFinish): %.3f ms\n",
 			    result.gpuRefMs);
 			printf("8) glReadPixels (RGBA32UI readback for benchmark): %.3f ms\n", result.readPixelsMs);
 			printf(
@@ -2123,10 +2295,18 @@ int main(int argc, char **argv) {
 			    result.passWallMs);
 			printf("10) Sum of 5)+6)+7)+8) (sequential stages): %.3f ms\n",
 			    result.mocBufferMs + result.mocQueryMs + result.gpuRefMs + result.readPixelsMs);
-			printf("--- errors (frustum subset only) ---\n");
+			printf("--- errors (frustum subset only; GPU ref = mesh, MOC = --moc-test geometry) ---\n");
 			printf("False positives (MOC visible, GPU no pixel): %u\n", result.fp);
 			printf("False negatives (MOC occluded/culled, GPU pixel): %u\n", result.fn);
-			printf("(Conservative culling should avoid false negatives; a non-zero count means mismatch.)\n");
+			if (!gpuDrawAlways)
+				printf(
+				    "(Default culled draw: FN column ~meaningless — occluded objects never submitted to GPU ref pass.)\n");
+			else if (mocOccludeeTest == MocOccludeeTestMode::Mesh)
+				printf(
+				    "(Mesh mode: conservative test vs same raster — FN>0 ⇒ Hi-Z/import/projection mismatch worth chasing.)\n");
+			else
+				printf(
+				    "(Proxy mode: FN counts mesh outside proxy footprint in Hi-Z test — expected if dop/AABB hull tighter than silhouette.)\n");
 			fflush(stdout);
 		}
 
@@ -2134,12 +2314,17 @@ int main(int argc, char **argv) {
 		/// No GUI in this path; 10)guiFrame= is 0.0. Omit when not headless so the window path does not double-print.
 		if (headless && maxFramesLimit > 0) {
 			const double guiFrameMs = 0.0;
+			const unsigned agr = result.agreeVisFrustum;
+			const bool inv =
+			    (agr + result.fp == result.nMocVisible) && (agr + result.fn == result.nGpuVisible) &&
+			    ((int)result.nGpuVisible - (int)result.nMocVisible == (int)result.fn - (int)result.fp);
 			std::fprintf(stderr,
-			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
+			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  agr=%u fp=%u fn=%u  stat=%s  "
 			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
 			    "10)guiFrame=%.3fms\n",
-			    result.nAll, result.nFrustum, result.nMocVisible, result.nGpuVisible, result.mocBufferMs, result.mocQueryMs,
-			    result.gpuRefMs, result.readPixelsMs, result.passWallMs, guiFrameMs);
+			    result.nAll, result.nFrustum, result.nMocVisible, result.nGpuVisible, agr, result.fp, result.fn,
+			    inv ? "ok" : "BUG", result.mocBufferMs, result.mocQueryMs, result.gpuRefMs, result.readPixelsMs,
+			    result.passWallMs, guiFrameMs);
 			std::fflush(stderr);
 		}
 
@@ -2320,8 +2505,18 @@ int main(int argc, char **argv) {
 			glDepthFunc(GL_LESS);
 			glUseProgram(progPreview);
 			glBindVertexArray(vao);
+			Vec4f previewFrustum[6];
+			FrustumPlanesMrGraphics(vp, previewFrustum);
 			for (size_t i = 0; i < objects.size(); ++i) {
 				const SceneObject &o = objects[i];
+				if (!MeshIsDrawable(*o.mesh))
+					continue;
+				Vec3f wcPreview[8];
+				ObjectWorldCorners(o, wcPreview);
+				if (!IsWorldAabbFrustumVisibleMrGraphics(previewFrustum, wcPreview))
+					continue;
+				if (!gpuDrawAlways && !guiBenchMocVisible[i])
+					continue;
 				Matr4f mvp = o.model * vp;
 				MrMatrToColumnMajorGl(mvp, mvpCol);
 				glUniformMatrix4fv(locMvpPrev, 1, GL_FALSE, mvpCol);
@@ -2474,12 +2669,17 @@ int main(int argc, char **argv) {
 			const auto tGuiFrame1 = std::chrono::steady_clock::now();
 			const double guiFrameMs =
 			    std::chrono::duration<double, std::milli>(tGuiFrame1 - tGuiFrame0).count();
-			std::fprintf(stderr,
-			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
-			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
-			    "10)guiFrame=%.3fms\n",
-			    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, br.mocBufferMs, br.mocQueryMs,
-			    br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
+			{
+				const unsigned agr = br.agreeVisFrustum;
+				const bool inv = (agr + br.fp == br.nMocVisible) && (agr + br.fn == br.nGpuVisible) &&
+				    ((int)br.nGpuVisible - (int)br.nMocVisible == (int)br.fn - (int)br.fp);
+				std::fprintf(stderr,
+				    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  agr=%u fp=%u fn=%u  stat=%s  "
+				    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
+				    "10)guiFrame=%.3fms\n",
+				    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, agr, br.fp, br.fn, inv ? "ok" : "BUG",
+				    br.mocBufferMs, br.mocQueryMs, br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
+			}
 			std::fflush(stderr);
 			guiPrevMocVisibleForOverlay.assign(guiBenchMocVisible.begin(), guiBenchMocVisible.end());
 			++frameI;
@@ -2491,6 +2691,7 @@ int main(int argc, char **argv) {
 
 	glDeleteRenderbuffers(1, &depthRb);
 	glDeleteTextures(1, &colorTex);
+	glDeleteTextures(1, &clipWTex);
 	glDeleteFramebuffers(1, &fbo);
 	glDeleteBuffers(1, &vbo);
 	glDeleteBuffers(1, &ebo);

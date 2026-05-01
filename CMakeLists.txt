@@ -12,7 +12,7 @@ set(CMAKE_CONFIGURATION_TYPES Debug Release)
 set( MOC_AVX512_FILES MaskedOcclusionCullingAVX512.cpp )
 set( MOC_AVX2_FILES MaskedOcclusionCullingAVX2.cpp )
 set( MOC_SSE_FILES MaskedOcclusionCulling.cpp CullingThreadpool.cpp )
-set( MOC_INCLUDE_FILES MaskedOcclusionCulling.h CullingThreadpool.h CompilerSpecific.inl MaskedOcclusionCullingCommon.inl )
+set( MOC_INCLUDE_FILES MaskedOcclusionCulling.h CullingThreadpool.h CompilerSpecific.inl MaskedOcclusionCullingCommon.inl MaskedOcclusionCullingFromDepth.inl )
 set( MOC_FILES ${MOC_AVX512_FILES} ${MOC_AVX2_FILES} ${MOC_SSE_FILES} ${MOC_INCLUDE_FILES} )
 
 #

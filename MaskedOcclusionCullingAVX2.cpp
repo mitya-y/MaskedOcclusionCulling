@@ -211,6 +211,7 @@ namespace MaskedOcclusionCullingAVX2
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 	#include "MaskedOcclusionCullingCommon.inl"
+	#include "MaskedOcclusionCullingFromDepth.inl"
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Utility function to create a new object using the allocator callbacks
@@ -225,6 +226,13 @@ namespace MaskedOcclusionCullingAVX2
 		new (object) MaskedOcclusionCullingPrivate(alignedAlloc, alignedFree);
 		return object;
 	}
+
+	MaskedOcclusionCulling *CreateMaskedOcclusionCullingFromDepth(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree)
+	{
+		MaskedOcclusionCullingFromDepthPrivate *object = (MaskedOcclusionCullingFromDepthPrivate *)alignedAlloc(64, sizeof(MaskedOcclusionCullingFromDepthPrivate));
+		new (object) MaskedOcclusionCullingFromDepthPrivate(alignedAlloc, alignedFree);
+		return object;
+	}
 };
 
 #else
@@ -235,6 +243,11 @@ namespace MaskedOcclusionCullingAVX2
 	typedef MaskedOcclusionCulling::pfnAlignedFree             pfnAlignedFree;
 
 	MaskedOcclusionCulling *CreateMaskedOcclusionCulling(pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree)
+	{
+		return nullptr;
+	}
+
+	MaskedOcclusionCulling *CreateMaskedOcclusionCullingFromDepth(pfnAlignedAlloc, pfnAlignedFree)
 	{
 		return nullptr;
 	}

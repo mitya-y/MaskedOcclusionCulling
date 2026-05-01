@@ -113,6 +113,8 @@ template<> FORCE_INLINE void VtxFetch4<0>(__mw *v, const unsigned int *inTrisPtr
 
 class MaskedOcclusionCullingPrivate : public MaskedOcclusionCulling
 {
+	friend class MaskedOcclusionCullingFromDepthPrivate;
+
 public:
 	struct ZTile
 	{

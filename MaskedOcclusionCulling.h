@@ -271,6 +271,12 @@ public:
 	static MaskedOcclusionCulling *Create(Implementation RequestedSIMD, pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
 
 	/*!
+	 * \brief Same as Create(), but the instance supports ImportPixelDepthBuffer() (dense per-pixel 1/w → hierarchical buffer).
+	 */
+	static MaskedOcclusionCulling *CreateFromDepth(Implementation RequestedSIMD = AVX512);
+	static MaskedOcclusionCulling *CreateFromDepth(Implementation RequestedSIMD, pfnAlignedAlloc alignedAlloc, pfnAlignedFree alignedFree);
+
+	/*!
 	 * \brief Destroys an object and frees the z buffer memory. Note that you cannot 
 	 * use the delete operator, and should rather use this function to free up memory.
 	 */
@@ -485,7 +491,13 @@ public:
 	 *        hold storage for atleast width*height elements as set by setResolution.
 	 */
 	virtual void ComputePixelDepthBuffer(float *depthData, bool flipY) = 0;
-	
+
+	/*!
+	 * \brief Fill hierarchical buffer from per-pixel values in internal depth units (1 / clip w).
+	 *        Same memory layout as ComputePixelDepthBuffer(..., flipY). Default no-op; use CreateFromDepth() for implementation.
+	 */
+	virtual void ImportPixelDepthBuffer(const float *pixelRcpW, bool flipY) { (void)pixelRcpW; (void)flipY; }
+
 	/*!
 	 * \brief Fetch occlusion culling statistics, returns zeroes if ENABLE_STATS define is
 	 *        not defined. The statistics can be used for profiling or debugging.
