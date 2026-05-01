@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -36,6 +37,9 @@
 #endif
 
 #include "../MaskedOcclusionCulling.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "third_party/stb_image_write.h"
 
 namespace {
 
@@ -1062,6 +1066,64 @@ static bool ParseMaxFramesArg(const char *s, int &out, const char *flagName) {
 	return true;
 }
 
+/// `--save-depth-frame=N`: 0-based benchmark pass index; writes `depthN.png` (per-pixel z from MOC hi-z).
+static bool ParseSaveDepthFrameArg(const char *s, int &out, const char *flagName) {
+	char *end = nullptr;
+	unsigned long v = std::strtoul(s, &end, 10);
+	if (end == s || *end != '\0') {
+		std::fprintf(stderr, "%s requires a non-negative integer (0 = first pass).\n", flagName);
+		return false;
+	}
+	if (v > 10000000ul) {
+		std::fprintf(stderr, "%s must be <= 10000000.\n", flagName);
+		return false;
+	}
+	out = (int)v;
+	return true;
+}
+
+/// Same tonemap idea as Example/ExampleMain (Intel sample): linear map w in [min,max] → gray 32…223.
+static void TonemapMocDepthToRgb(const float *depth, unsigned char *imageRgb, int w, int h) {
+	float minW = FLT_MAX, maxW = 0.f;
+	for (int i = 0; i < w * h; ++i) {
+		if (depth[i] > 0.f) {
+			minW = std::min(minW, depth[i]);
+			maxW = std::max(maxW, depth[i]);
+		}
+	}
+	const float range = maxW - minW;
+	for (int i = 0; i < w * h; ++i) {
+		int intensity = 0;
+		if (depth[i] > 0.f && range > 1e-20f) {
+			const float t = (depth[i] - minW) / range;
+			intensity = (int)(223.0 * (double)t + 32.0);
+			if (intensity < 0)
+				intensity = 0;
+			else if (intensity > 255)
+				intensity = 255;
+		}
+		imageRgb[i * 3 + 0] = (unsigned char)intensity;
+		imageRgb[i * 3 + 1] = (unsigned char)intensity;
+		imageRgb[i * 3 + 2] = (unsigned char)intensity;
+	}
+}
+
+static constexpr char kAccbenchSaveDepthPrefix[] = "--save-depth-frame=";
+
+static bool SaveMocHizDepthPng(MaskedOcclusionCulling *moc, int w, int h, const char *pathOut) {
+	std::vector<float> depth((size_t)w * (size_t)h);
+	// USE_D3D=0: flipY=true so first scanline = top of screen like GL viewport / PNG viewers (see
+	// MaskedOcclusionCullingCommon.inl; FrameRecorderPlayer uses true).
+	moc->ComputePixelDepthBuffer(depth.data(), true);
+	std::vector<unsigned char> rgb((size_t)w * (size_t)h * 3);
+	TonemapMocDepthToRgb(depth.data(), rgb.data(), w, h);
+	if (!stbi_write_png(pathOut, w, h, 3, rgb.data(), w * 3)) {
+		std::fprintf(stderr, "stbi_write_png failed: %s\n", pathOut);
+		return false;
+	}
+	return true;
+}
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
@@ -1073,6 +1135,8 @@ int main(int argc, char **argv) {
 	float clipFar = 1000.f;
 	/// 0: default (unbounded preview; headless: single benchmark pass).  N>0: see --max-frames=.
 	int maxFramesLimit = 0;
+	/// -1: off. Else save `depthN.png` on pass index N (0-based) after MOC occluder rasterization.
+	int saveMocDepthFrame = -1;
 	MocOccludeeTestMode mocOccludeeTest = MocOccludeeTestMode::Mesh;
 	int mocDopK = 26;
 	const char *mocTestEnv = std::getenv("ACCURACYBENCH_MOC_TEST");
@@ -1185,6 +1249,21 @@ int main(int argc, char **argv) {
 				return 1;
 			}
 			if (!ParseMaxFramesArg(argv[++i], maxFramesLimit, "--max-frames"))
+				return 1;
+			continue;
+		}
+		if (!std::strncmp(argv[i], kAccbenchSaveDepthPrefix, sizeof(kAccbenchSaveDepthPrefix) - 1)) {
+			if (!ParseSaveDepthFrameArg(argv[i] + sizeof(kAccbenchSaveDepthPrefix) - 1, saveMocDepthFrame,
+				"--save-depth-frame="))
+				return 1;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--save-depth-frame")) {
+			if (i + 1 >= argc) {
+				std::fprintf(stderr, "--save-depth-frame requires a non-negative integer.\n");
+				return 1;
+			}
+			if (!ParseSaveDepthFrameArg(argv[++i], saveMocDepthFrame, "--save-depth-frame"))
 				return 1;
 			continue;
 		}
@@ -1357,7 +1436,7 @@ int main(int argc, char **argv) {
 		double passWallMs = 0;
 	};
 
-	auto runBenchmarkPass = [&](const Matr4f &vp, const Vec3f &camPosForSort,
+	auto runBenchmarkPass = [&](int passFrameIndex, const Matr4f &vp, const Vec3f &camPosForSort,
 	                    BenchPrintStyle printStyle) -> AccBenchPassResult {
 		const auto tPassWall0 = std::chrono::steady_clock::now();
 		MaskedOcclusionCulling *moc = MaskedOcclusionCulling::Create(MocImplFromEnv());
@@ -1422,6 +1501,19 @@ int main(int argc, char **argv) {
 		const auto tMocBuffer1 = std::chrono::steady_clock::now();
 		const double mocBufferMs =
 		    std::chrono::duration<double, std::milli>(tMocBuffer1 - tMocBuffer0).count();
+
+		if (saveMocDepthFrame >= 0 && passFrameIndex == saveMocDepthFrame) {
+			char path[96];
+			std::snprintf(path, sizeof(path), "moc_depth%d.png", passFrameIndex);
+			if (SaveMocHizDepthPng(moc, fbW, fbH, path)) {
+				std::error_code ec;
+				const std::filesystem::path abs =
+				    std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+				const std::string show =
+				    ec ? std::filesystem::absolute(std::filesystem::path(path)).generic_string() : abs.generic_string();
+				std::fprintf(stderr, "Wrote MOC hierarchical-z → per-pixel depth (tonemapped): %s\n", show.c_str());
+			}
+		}
 
 		const unsigned nAll = (unsigned)objects.size();
 		unsigned nFrustum = 0;
@@ -1788,16 +1880,30 @@ int main(int argc, char **argv) {
 		return result;
 	};
 
+	if (saveMocDepthFrame >= 0) {
+		std::error_code ecCwd;
+		const std::filesystem::path cwd = std::filesystem::current_path(ecCwd);
+		std::fprintf(stderr, "ACCURACYBENCH: --save-depth-frame → PNG written under cwd: %s\n",
+		    ecCwd ? "(current_path failed)" : cwd.generic_string().c_str());
+	}
+
 	Matr4f vpBench = fps.viewProj();
 	Vec3f camPosBench = fps.cam().position();
-	if (headless && maxFramesLimit > 0) {
+	/// Batch N passes: always when headless+--max-frames; also when --save-depth-frame set (so dump
+	/// works without --headless — otherwise only pass 0 runs before GUI, frame K needs K+1 swaps).
+	if (maxFramesLimit > 0 && (headless || saveMocDepthFrame >= 0)) {
+		if (saveMocDepthFrame >= maxFramesLimit) {
+			std::fprintf(stderr,
+			    "ACCURACYBENCH: --save-depth-frame=%d >= --max-frames=%d (valid indices 0..%d); no save.\n",
+			    saveMocDepthFrame, maxFramesLimit, maxFramesLimit - 1);
+		}
 		for (int f = 0; f < maxFramesLimit; ++f) {
 			Matr4f vpB = fps.viewProj();
 			Vec3f cpos = fps.cam().position();
-			runBenchmarkPass(vpB, cpos, f == 0 ? BenchPrintStyle::Full : BenchPrintStyle::LiveFour);
+			runBenchmarkPass(f, vpB, cpos, f == 0 ? BenchPrintStyle::Full : BenchPrintStyle::LiveFour);
 		}
 	} else
-		runBenchmarkPass(vpBench, camPosBench, BenchPrintStyle::Full);
+		runBenchmarkPass(0, vpBench, camPosBench, BenchPrintStyle::Full);
 
 	if (!headless) {
 		printf("\nInteractive preview: WASD + Space/Z, Shift sprint, mouse look, scroll = move speed; "
@@ -1903,7 +2009,8 @@ int main(int argc, char **argv) {
 
 			Matr4f vp = fps.viewProj();
 			const auto tGuiFrame0 = std::chrono::steady_clock::now();
-			AccBenchPassResult br = runBenchmarkPass(vp, fps.cam().position(), BenchPrintStyle::LiveFour);
+			AccBenchPassResult br =
+			    runBenchmarkPass(frameI, vp, fps.cam().position(), BenchPrintStyle::LiveFour);
 			float mvpCol[16];
 
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
