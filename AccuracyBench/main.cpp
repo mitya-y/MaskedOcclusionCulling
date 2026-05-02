@@ -2426,7 +2426,7 @@ int main(int argc, char **argv) {
 
 			// Same normalization as mr::graphics Scene::update (mouse delta / extent, minus Y for screen space).
 			Vec3f angularDelta{dx / float(std::max(winW, 1)), -dy / float(std::max(winH, 1)), 0.f};
-			fps.turn(angularDelta);
+			// fps.turn(angularDelta);
 
 			float speedup = glfwGetKey(win, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ? 10.f : 1.f;
 			if (glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS)
@@ -2442,18 +2442,33 @@ int main(int argc, char **argv) {
 			if (glfwGetKey(win, GLFW_KEY_Z) == GLFW_PRESS)
 				fps.move(-Vec3f(fps.cam().up()) * speedup);
 
-			static bool k1, k2, k3, k4, k5, k6, k0, kEsc, kP;
+			static bool k1, k2, k3, k4, k5, k6, k0, kEsc, kP, mbLeft;
 			auto edge = [&](int key, bool &prev) {
 				bool now = glfwGetKey(win, key) == GLFW_PRESS;
 				bool e = now && !prev;
 				prev = now;
 				return e;
 			};
+			auto mouseEdge = [&](int button, bool &prev) {
+				bool now = glfwGetMouseButton(win, button) == GLFW_PRESS;
+				bool e = now && !prev;
+				prev = now;
+				return e;
+			};
+			bool leftClick = false;
+			double clickCx = 0.0, clickCy = 0.0;
+			int clickWx = 0, clickWy = 0;
+			if (mouseEdge(GLFW_MOUSE_BUTTON_LEFT, mbLeft)) {
+				leftClick = true;
+				clickCx = cx;
+				clickCy = cy;
+				glfwGetWindowPos(win, &clickWx, &clickWy);
+			}
 			if (edge(GLFW_KEY_P, kP)) {
 				Vec3f p = fps.cam().position();
 				Vec3f d = Vec3f(fps.cam().direction());
 				Vec3f u = Vec3f(fps.cam().up());
-				printf("camera pos (%.3f, %.3f, %.3f) dir (%.3f, %.3f, %.3f) up (%.3f, %.3f, %.3f)\n",
+				printf("((%.3f, %.3f, %.3f), (%.3f, %.3f, %.3f), (%.3f, %.3f, %.3f))\n",
 				    p.x(), p.y(), p.z(), d.x(), d.y(), d.z(), u.x(), u.y(), u.z());
 			}
 			if (edge(GLFW_KEY_1, k1))
@@ -2494,6 +2509,24 @@ int main(int argc, char **argv) {
 			const int vh = std::max(1, (int)(fbH * scale + 0.5f));
 			const int ox = (winW - vw) / 2;
 			const int oy = (winH - vh) / 2;
+			if (leftClick) {
+				if (clickCx >= ox && clickCx < ox + vw && clickCy >= oy && clickCy < oy + vh) {
+					const int fboX = std::min(fbW - 1, std::max(0, (int)((clickCx - ox) * fbW / vw)));
+					const int fboYTop = std::min(fbH - 1, std::max(0, (int)((clickCy - oy) * fbH / vh)));
+					const int fboY = fbH - 1 - fboYTop;
+					unsigned idPixel[4] = {};
+					glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+					glReadBuffer(GL_COLOR_ATTACHMENT0);
+					glReadPixels(fboX, fboY, 1, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, idPixel);
+					CheckGl("click object id readpixels");
+					glBindFramebuffer(GL_FRAMEBUFFER, 0);
+					printf("cursor screen: (%.0f, %.0f), object id: %u\n", clickWx + clickCx, clickWy + clickCy,
+					    idPixel[3]);
+				} else {
+					printf("cursor screen: (%.0f, %.0f), object id: 0 (outside viewport)\n", clickWx + clickCx,
+					    clickWy + clickCy);
+				}
+			}
 			glViewport(ox, oy, vw, vh);
 			glEnable(GL_SCISSOR_TEST);
 			glScissor(ox, oy, vw, vh);
