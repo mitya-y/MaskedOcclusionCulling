@@ -1308,7 +1308,7 @@ static bool ParseMaxFramesArg(const char *s, int &out, const char *flagName) {
 	return true;
 }
 
-/// `--save-depth-frame=N`: 0-based benchmark pass index; writes `depthN.png` (per-pixel z from MOC hi-z).
+/// `--save-depth-frame=N`: saves `depthN.png` (GL_DEPTH renderbuffer) + `moc_depthN.png` (MOC `ComputePixelDepthBuffer`).
 static bool ParseSaveDepthFrameArg(const char *s, int &out, const char *flagName) {
 	char *end = nullptr;
 	unsigned long v = std::strtoul(s, &end, 10);
@@ -1321,6 +1321,149 @@ static bool ParseSaveDepthFrameArg(const char *s, int &out, const char *flagName
 		return false;
 	}
 	out = (int)v;
+	return true;
+}
+
+struct VisibilityAnalyzeRow {
+	uint32_t object_id = 0;
+	bool drawable = false;
+	bool frustum_hit = false;
+	bool moc_queried = false;
+	bool occlusion_query_executed = false;
+	MaskedOcclusionCulling::CullingResult moc_raw = MaskedOcclusionCulling::VISIBLE;
+	std::string occludee_path;
+	bool has_ndc_rect = false;
+	float rx0_ndc = 0.f, ry0_ndc = 0.f, rx1_ndc = 0.f, ry1_ndc = 0.f, rw_min_clip = 0.f;
+	/// Matching TestRect truncation + clamp → top-left pixel rect (PNG order).
+	bool has_proxy_pixels_tl = false;
+	int proxy_px_x0_tl = 0, proxy_px_y0_tl = 0, proxy_px_x1_tl = 0, proxy_px_y1_tl = 0;
+};
+
+static const char *VisibilityAnalyzeReason(const VisibilityAnalyzeRow &row) {
+	if (!row.frustum_hit)
+		return "outside_frustum";
+	if (!row.drawable)
+		return "not_drawable";
+	if (!row.moc_queried)
+		return "not_drawable";
+	if (!row.occlusion_query_executed && row.moc_raw == MaskedOcclusionCulling::VIEW_CULLED)
+		return "aabb_projection_failed";
+	switch (row.moc_raw) {
+	case MaskedOcclusionCulling::VISIBLE:
+		return "moc_visible";
+	case MaskedOcclusionCulling::OCCLUDED:
+		return "moc_occluded";
+	case MaskedOcclusionCulling::VIEW_CULLED:
+		return "moc_view_culled";
+	}
+	return "moc_view_culled";
+}
+
+/*!
+ * Match MaskedOcclusionCulling::TestRect (USE_D3D=0): cvttps_epi32 on
+ *   x*width/2 + width/2, y*height/2 + height/2
+ * then clamp each edge to [0..w-1],[0..h-1] like _mm_min_epi32(mIScreenSize, ...).
+ * Output rows are top-left origin (same as ComputePixelDepthBuffer flipY=true / PNG).
+ */
+static void NdcBoundsToInclusivePixelRectTl(float rx0, float ry0, float rx1, float ry1, int fbW,
+    int fbH, int &outX0Tl, int &outY0Tl, int &outX1Tl, int &outY1Tl, bool &outNonEmpty) {
+	const float nx0 = std::min(rx0, rx1);
+	const float nx1 = std::max(rx0, rx1);
+	const float nyLo = std::min(ry0, ry1);
+	const float nyHi = std::max(ry0, ry1);
+
+	const float hw = float(fbW) * 0.5f;
+	const float hh = float(fbH) * 0.5f;
+	// C++ (int)float truncates toward zero — same as _mm_cvttps_epi32 for values in (0..fb).
+	int ixMin = int(nx0 * hw + hw);
+	int ixMax = int(nx1 * hw + hw);
+	int iyBotMin = int(nyLo * hh + hh);
+	int iyBotMax = int(nyHi * hh + hh);
+
+	ixMin = std::clamp(ixMin, 0, fbW - 1);
+	ixMax = std::clamp(ixMax, 0, fbW - 1);
+	iyBotMin = std::clamp(iyBotMin, 0, fbH - 1);
+	iyBotMax = std::clamp(iyBotMax, 0, fbH - 1);
+
+	if (ixMin > ixMax || iyBotMin > iyBotMax) {
+		outNonEmpty = false;
+		return;
+	}
+
+	outX0Tl = ixMin;
+	outX1Tl = ixMax;
+	const int yTop0 = fbH - 1 - iyBotMax;
+	const int yTop1 = fbH - 1 - iyBotMin;
+	outY0Tl = std::min(yTop0, yTop1);
+	outY1Tl = std::max(yTop0, yTop1);
+	outNonEmpty = true;
+}
+
+static void VisibilityAnalyzeFillProxyRectsTl(std::vector<VisibilityAnalyzeRow> &rows, int fbW, int fbH) {
+	for (VisibilityAnalyzeRow &row : rows) {
+		row.has_proxy_pixels_tl = false;
+		if (!row.has_ndc_rect)
+			continue;
+		bool ok = false;
+		NdcBoundsToInclusivePixelRectTl(row.rx0_ndc, row.ry0_ndc, row.rx1_ndc, row.ry1_ndc, fbW, fbH,
+		    row.proxy_px_x0_tl, row.proxy_px_y0_tl, row.proxy_px_x1_tl, row.proxy_px_y1_tl, ok);
+		row.has_proxy_pixels_tl = ok;
+	}
+}
+
+static bool WriteVisibilityAnalyzeJson(const char *pathOut, int passFrameIndex, int fbW, int fbH,
+    float clipNear, float clipFar, bool use_prev_frame_prev, bool gpu_draw_always,
+    const char *moc_test_label, const std::vector<VisibilityAnalyzeRow> &rows) {
+	FILE *fp = std::fopen(pathOut, "w");
+	if (!fp) {
+		std::fprintf(stderr, "failed to open %s for write\n", pathOut);
+		return false;
+	}
+	std::fprintf(fp, "{\n");
+	std::fprintf(fp, "  \"pass_frame_index\": %d,\n", passFrameIndex);
+	std::fprintf(fp, "  \"fb_width\": %d,\n", fbW);
+	std::fprintf(fp, "  \"fb_height\": %d,\n", fbH);
+	std::fprintf(fp, "  \"clip_near\": %.9g,\n", (double)clipNear);
+	std::fprintf(fp, "  \"clip_far\": %.9g,\n", (double)clipFar);
+	std::fprintf(fp, "  \"moc_test\": \"%s\",\n", moc_test_label);
+	std::fprintf(fp, "  \"use_prev_frame_prev\": %s,\n", use_prev_frame_prev ? "true" : "false");
+	std::fprintf(fp, "  \"gpu_draw_always\": %s,\n", gpu_draw_always ? "true" : "false");
+	std::fprintf(fp, "  \"objects\": [\n");
+	for (size_t i = 0; i < rows.size(); ++i) {
+		const VisibilityAnalyzeRow &r = rows[i];
+		const char *mocStr = !r.moc_queried ? "NONE" : MocResultStr(r.moc_raw);
+		std::fprintf(fp, "    {\n");
+		std::fprintf(fp, "      \"index\": %zu,\n", i);
+		std::fprintf(fp, "      \"object_id\": %u,\n", r.object_id);
+		std::fprintf(fp, "      \"drawable\": %s,\n", r.drawable ? "true" : "false");
+		std::fprintf(fp, "      \"frustum_hit\": %s,\n", r.frustum_hit ? "true" : "false");
+		std::fprintf(fp, "      \"moc_queried\": %s,\n", r.moc_queried ? "true" : "false");
+		std::fprintf(fp, "      \"moc_result\": \"%s\",\n", mocStr);
+		std::fprintf(fp, "      \"reason\": \"%s\",\n", VisibilityAnalyzeReason(r));
+		std::fprintf(fp, "      \"occludee_path\": \"%s\",\n", r.occludee_path.c_str());
+		std::fprintf(fp, "      \"occlusion_query_executed\": %s,\n",
+		    r.occlusion_query_executed ? "true" : "false");
+		if (r.has_ndc_rect) {
+			std::fprintf(fp,
+			    "      \"ndc_proxy_rect\": {\"rx0_ndc\":%.9g,\"ry0_ndc\":%.9g,\"rx1_ndc\":%.9g,"
+			    "\"ry1_ndc\":%.9g,\"rw_min_clip\":%.9g},\n",
+			    (double)r.rx0_ndc, (double)r.ry0_ndc, (double)r.rx1_ndc, (double)r.ry1_ndc,
+			    (double)r.rw_min_clip);
+		} else {
+			std::fprintf(fp, "      \"ndc_proxy_rect\": null,\n");
+		}
+		if (r.has_proxy_pixels_tl) {
+			std::fprintf(fp,
+			    "      \"proxy_rect_pixels_tl\": "
+			    "{\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"inclusive\":true,\"origin\":\"top_left\"}\n",
+			    r.proxy_px_x0_tl, r.proxy_px_y0_tl, r.proxy_px_x1_tl, r.proxy_px_y1_tl);
+		} else {
+			std::fprintf(fp, "      \"proxy_rect_pixels_tl\": null\n");
+		}
+		std::fprintf(fp, "    }%s\n", i + 1 < rows.size() ? "," : "");
+	}
+	std::fprintf(fp, "  ]\n}\n");
+	std::fclose(fp);
 	return true;
 }
 
@@ -1350,7 +1493,56 @@ static void TonemapMocDepthToRgb(const float *depth, unsigned char *imageRgb, in
 	}
 }
 
+/// Linear map framebuffer depth `[zMin,zMax]` geometry (OpenGL clear = 1) → grayscale 32…223 like `TonemapMocDepthToRgb`.
+static void TonemapGlDepthRbToRgb(const float *depthTopFirst, unsigned char *imageRgb, int w, int h) {
+	const float kFarClear = 1.f;
+	const float kClearEps = 5e-5f;
+	float minW = FLT_MAX, maxW = 0.f;
+	for (int i = 0; i < w * h; ++i) {
+		const float d = depthTopFirst[i];
+		if (!(std::isfinite(d)) || d <= 0.f || d >= kFarClear - kClearEps)
+			continue;
+		minW = std::min(minW, d);
+		maxW = std::max(maxW, d);
+	}
+	const float range = maxW - minW;
+	for (int i = 0; i < w * h; ++i) {
+		int intensity = 0;
+		const float d = depthTopFirst[i];
+		if (std::isfinite(d) && d > 0.f && d < kFarClear - kClearEps && range > 1e-20f) {
+			const float t = (d - minW) / range;
+			intensity = (int)(223.0 * (double)t + 32.0);
+			if (intensity < 0)
+				intensity = 0;
+			else if (intensity > 255)
+				intensity = 255;
+		}
+		imageRgb[i * 3 + 0] = (unsigned char)intensity;
+		imageRgb[i * 3 + 1] = (unsigned char)intensity;
+		imageRgb[i * 3 + 2] = (unsigned char)intensity;
+	}
+}
+
+/// Read `GL_DEPTH_COMPONENT` from current `GL_FRAMEBUFFER`, flip rows to top-first (PNG order).
+static bool SaveGlFbDepthTonemapPng(int w, int h, const char *pathOut) {
+	std::vector<float> bot((size_t)w * (size_t)h);
+	glReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, bot.data());
+	CheckGl("readpixels depth for depth.png");
+	std::vector<float> top(bot.size());
+	for (int y = 0; y < h; ++y)
+		std::memcpy(top.data() + (size_t)y * (size_t)w, bot.data() + (size_t)(h - 1 - y) * (size_t)w,
+		    (size_t)w * sizeof(float));
+	std::vector<unsigned char> rgb((size_t)w * (size_t)h * 3);
+	TonemapGlDepthRbToRgb(top.data(), rgb.data(), w, h);
+	if (!stbi_write_png(pathOut, w, h, 3, rgb.data(), w * 3)) {
+		std::fprintf(stderr, "stbi_write_png failed: %s\n", pathOut);
+		return false;
+	}
+	return true;
+}
+
 static constexpr char kAccbenchSaveDepthPrefix[] = "--save-depth-frame=";
+static constexpr char kAccbenchAnalyzeFramePrefix[] = "--analyze-frame=";
 
 static bool SaveMocHizDepthPng(MaskedOcclusionCulling *moc, int w, int h, const char *pathOut) {
 	std::vector<float> depth((size_t)w * (size_t)h);
@@ -1397,8 +1589,10 @@ int main(int argc, char **argv) {
 	float clipFar = 1000.f;
 	/// 0: default (unbounded preview; headless: single benchmark pass).  N>0: see --max-frames=.
 	int maxFramesLimit = 0;
-	/// -1: off. Else save `depthN.png` on pass index N (0-based) after MOC occluder rasterization.
+	/// -1: off. Else save `depthN.png` + `moc_depthN.png` on pass N (0-based); see save block.
 	int saveMocDepthFrame = -1;
+	/// -1: off. Else write `visibility_analyze.json` for pass index N (same numbering as --save-depth-frame).
+	int analyzeFrame = -1;
 	bool visualizeBounds = false;
 	bool visualizeBoundProjection = false;
 	MocOccludeeTestMode mocOccludeeTest = MocOccludeeTestMode::Mesh;
@@ -1528,6 +1722,21 @@ int main(int argc, char **argv) {
 				return 1;
 			}
 			if (!ParseSaveDepthFrameArg(argv[++i], saveMocDepthFrame, "--save-depth-frame"))
+				return 1;
+			continue;
+		}
+		if (!std::strncmp(argv[i], kAccbenchAnalyzeFramePrefix, sizeof(kAccbenchAnalyzeFramePrefix) - 1)) {
+			if (!ParseSaveDepthFrameArg(argv[i] + sizeof(kAccbenchAnalyzeFramePrefix) - 1, analyzeFrame,
+			        "--analyze-frame="))
+				return 1;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--analyze-frame")) {
+			if (i + 1 >= argc) {
+				std::fprintf(stderr, "--analyze-frame requires a non-negative integer (0 = first pass).\n");
+				return 1;
+			}
+			if (!ParseSaveDepthFrameArg(argv[++i], analyzeFrame, "--analyze-frame"))
 				return 1;
 			continue;
 		}
@@ -1914,6 +2123,23 @@ int main(int argc, char **argv) {
 		}
 
 		if (saveMocDepthFrame >= 0 && passFrameIndex == saveMocDepthFrame) {
+			glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+			/// `--use-prev-frame-prev`: depth already valid from pass-start draw; else rasterize full frustum once.
+			if (!usePrevFramePrev) {
+				drawGpuReferenceFill(vp, nullptr);
+				glFinish();
+			}
+			char pathGl[96];
+			std::snprintf(pathGl, sizeof(pathGl), "depth%d.png", passFrameIndex);
+			if (SaveGlFbDepthTonemapPng(fbW, fbH, pathGl)) {
+				std::error_code ec;
+				const std::filesystem::path abs =
+				    std::filesystem::weakly_canonical(std::filesystem::path(pathGl), ec);
+				const std::string show =
+				    ec ? std::filesystem::absolute(std::filesystem::path(pathGl)).generic_string()
+				       : abs.generic_string();
+				std::fprintf(stderr, "Wrote GL depth buffer (tonemapped): %s\n", show.c_str());
+			}
 			char path[96];
 			std::snprintf(path, sizeof(path), "moc_depth%d.png", passFrameIndex);
 			if (SaveMocHizDepthPng(moc, fbW, fbH, path)) {
@@ -1939,6 +2165,11 @@ int main(int argc, char **argv) {
 		std::vector<MaskedOcclusionCulling::CullingResult> mocRaw(nAll);
 		std::vector<char> gpuVis(nAll, 0);
 
+		const bool doVisAnalyze = (analyzeFrame >= 0 && passFrameIndex == analyzeFrame);
+		std::vector<VisibilityAnalyzeRow> visRows;
+		if (doVisAnalyze)
+			visRows.resize(nAll);
+
 		Vec4f frustumPlanes[6];
 		FrustumPlanesMrGraphics(vp, frustumPlanes);
 
@@ -1950,6 +2181,12 @@ int main(int argc, char **argv) {
 			frustumHit[i] = inf ? 1 : 0;
 			if (inf)
 				++nFrustum;
+			if (doVisAnalyze) {
+				VisibilityAnalyzeRow &vr = visRows[i];
+				vr.object_id = o.id;
+				vr.frustum_hit = inf;
+				vr.drawable = MeshIsDrawable(*o.mesh);
+			}
 		}
 
 		const auto tMocQuery0 = std::chrono::steady_clock::now();
@@ -1962,13 +2199,25 @@ int main(int argc, char **argv) {
 				continue;
 			Matr4f mvp = o.model * vp;
 			MaskedOcclusionCulling::CullingResult r = MaskedOcclusionCulling::VIEW_CULLED;
+			bool occlusionQueryExecuted = false;
+			std::string occPath;
+			bool hasNdcRect = false;
+			float srx0 = 0.f, sry0 = 0.f, srx1 = 0.f, sry1 = 0.f, srw = 0.f;
 			if (mocOccludeeTest == MocOccludeeTestMode::AabbScreenRect) {
+				occPath = "aabb_rect";
 				Vec3f wc[8];
 				ObjectWorldCorners(o, wc);
 				float rx0, ry0, rx1, ry1, rwMin;
-				if (TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin))
+				if (TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin)) {
+					occlusionQueryExecuted = true;
+					hasNdcRect = true;
+					srx0 = rx0;
+					sry0 = ry0;
+					srx1 = rx1;
+					sry1 = ry1;
+					srw = rwMin;
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
-				else
+				} else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
 			} else if (mocOccludeeTest == MocOccludeeTestMode::AabbScreenTriangles) {
 				Vec3f wc[8];
@@ -1982,6 +2231,8 @@ int main(int argc, char **argv) {
 						std::vector<float> clipVerts;
 						std::vector<unsigned> triIdx;
 						if (BuildClipFanFromHull(hull, wRef, clipVerts, triIdx)) {
+							occPath = "aabb_tri";
+							occlusionQueryExecuted = true;
 							r = moc->TestTriangles(
 							    clipVerts.data(),
 							    triIdx.data(),
@@ -1995,10 +2246,18 @@ int main(int argc, char **argv) {
 					}
 				}
 				if (!usedTriangles) {
+					occPath = "aabb_tri_fallback_rect";
 					float rx0, ry0, rx1, ry1, rwMin;
-					if (TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin))
+					if (TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin)) {
+						occlusionQueryExecuted = true;
+						hasNdcRect = true;
+						srx0 = rx0;
+						sry0 = ry0;
+						srx1 = rx1;
+						sry1 = ry1;
+						srw = rwMin;
 						r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
-					else
+					} else
 						r = MaskedOcclusionCulling::VIEW_CULLED;
 				}
 			} else if (mocOccludeeTest == MocOccludeeTestMode::DopKScreenRect) {
@@ -2010,21 +2269,31 @@ int main(int argc, char **argv) {
 				float rx0, ry0, rx1, ry1, rwMin;
 				bool got = false;
 				if (!dop) {
+					occPath = "aabb_rect";
 					Vec3f wc[8];
 					ObjectWorldCorners(o, wc);
 					got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
 				} else {
+					occPath = "dop_rect";
 					got = TryWorldDop26ProjectToTestRect(
 					    dop->localVerts, dop->edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
 					if (!got) {
+						occPath = "dop_rect_aabb_fallback";
 						Vec3f wc[8];
 						ObjectWorldCorners(o, wc);
 						got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
 					}
 				}
-				if (got)
+				if (got) {
+					occlusionQueryExecuted = true;
+					hasNdcRect = true;
+					srx0 = rx0;
+					sry0 = ry0;
+					srx1 = rx1;
+					sry1 = ry1;
+					srw = rwMin;
 					r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
-				else
+				} else
 					r = MaskedOcclusionCulling::VIEW_CULLED;
 			} else if (mocOccludeeTest == MocOccludeeTestMode::DopKScreenTriangles) {
 				EnsureMeshDopK(mesh, mocDopK);
@@ -2043,6 +2312,8 @@ int main(int argc, char **argv) {
 							std::vector<float> clipVerts;
 							std::vector<unsigned> triIdx;
 							if (BuildClipFanFromHull(hull, wRef, clipVerts, triIdx)) {
+								occPath = "dop_tri";
+								occlusionQueryExecuted = true;
 								r = moc->TestTriangles(
 								    clipVerts.data(),
 								    triIdx.data(),
@@ -2060,24 +2331,36 @@ int main(int argc, char **argv) {
 					float rx0, ry0, rx1, ry1, rwMin;
 					bool got = false;
 					if (!dop) {
+						occPath = "aabb_rect";
 						Vec3f wc[8];
 						ObjectWorldCorners(o, wc);
 						got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
 					} else {
+						occPath = "dop_tri_fallback_rect";
 						got = TryWorldDop26ProjectToTestRect(
 						    dop->localVerts, dop->edges, o.model, vp, rx0, ry0, rx1, ry1, rwMin);
 						if (!got) {
+							occPath = "dop_tri_fallback_aabb_rect";
 							Vec3f wc[8];
 							ObjectWorldCorners(o, wc);
 							got = TryWorldAabbProjectToTestRect(wc, vp, rx0, ry0, rx1, ry1, rwMin);
 						}
 					}
-					if (got)
+					if (got) {
+						occlusionQueryExecuted = true;
+						hasNdcRect = true;
+						srx0 = rx0;
+						sry0 = ry0;
+						srx1 = rx1;
+						sry1 = ry1;
+						srw = rwMin;
 						r = moc->TestRect(rx0, ry0, rx1, ry1, rwMin);
-					else
+					} else
 						r = MaskedOcclusionCulling::VIEW_CULLED;
 				}
 			} else {
+				occPath = "mesh";
+				occlusionQueryExecuted = true;
 				MrMatrToColumnMajorGl(mvp, mvpCol);
 				std::vector<float> clipVerts(mesh.positions.size() * 4);
 				MaskedOcclusionCulling::TransformVertices(
@@ -2094,6 +2377,21 @@ int main(int argc, char **argv) {
 				    MaskedOcclusionCulling::BACKFACE_CW,
 				    MaskedOcclusionCulling::CLIP_PLANE_ALL,
 				    MaskedOcclusionCulling::VertexLayout(16, 4, 12));
+			}
+			if (doVisAnalyze) {
+				VisibilityAnalyzeRow &vr = visRows[i];
+				vr.moc_queried = true;
+				vr.moc_raw = r;
+				vr.occlusion_query_executed = occlusionQueryExecuted;
+				vr.occludee_path = std::move(occPath);
+				vr.has_ndc_rect = hasNdcRect;
+				if (hasNdcRect) {
+					vr.rx0_ndc = srx0;
+					vr.ry0_ndc = sry0;
+					vr.rx1_ndc = srx1;
+					vr.ry1_ndc = sry1;
+					vr.rw_min_clip = srw;
+				}
 			}
 			mocTested[i] = 1;
 			mocRaw[i] = r;
@@ -2140,6 +2438,28 @@ int main(int argc, char **argv) {
 			uint32_t id = objects[i].id;
 			if (uniq.count(id))
 				gpuVis[i] = 1;
+		}
+
+		if (doVisAnalyze) {
+			VisibilityAnalyzeFillProxyRectsTl(visRows, fbW, fbH);
+			const char *analyzePath = "visibility_analyze.json";
+			std::string mocTestLabelStr = MocTestModeLabel(mocOccludeeTest, mocDopK);
+			if (WriteVisibilityAnalyzeJson(analyzePath, passFrameIndex, fbW, fbH,
+			        fps.cam().projection().distance, fps.cam().projection().far, usePrevFramePrev,
+			        gpuDrawAlways, mocTestLabelStr.c_str(), visRows)) {
+				std::error_code ec;
+				const std::filesystem::path abs =
+				    std::filesystem::weakly_canonical(std::filesystem::path(analyzePath), ec);
+				const std::string show =
+				    ec ? std::filesystem::absolute(std::filesystem::path(analyzePath)).generic_string()
+				       : abs.generic_string();
+				std::fprintf(stderr, "Wrote visibility analyze (per-object): %s (pass_frame_index=%d).\n",
+				    show.c_str(), passFrameIndex);
+				if (!headless)
+					std::fprintf(stderr,
+					    "  Preview: one extra pass_frame_index=0 benchmark runs before the GLFW loop — "
+					    "same camera can write this file twice on startup.\n");
+			}
 		}
 
 		/// Match nMocVisible domain: only instances that passed world-AABB frustum test (same loop as MOC queries).
@@ -2344,19 +2664,34 @@ int main(int argc, char **argv) {
 	if (saveMocDepthFrame >= 0) {
 		std::error_code ecCwd;
 		const std::filesystem::path cwd = std::filesystem::current_path(ecCwd);
-		std::fprintf(stderr, "ACCURACYBENCH: --save-depth-frame → PNG written under cwd: %s\n",
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: --save-depth-frame → depth*.png + moc_depth*.png under cwd: %s\n",
+		    ecCwd ? "(current_path failed)" : cwd.generic_string().c_str());
+	}
+
+	if (analyzeFrame >= 0) {
+		std::error_code ecCwd;
+		const std::filesystem::path cwd = std::filesystem::current_path(ecCwd);
+		std::fprintf(stderr,
+		    "ACCURACYBENCH: --analyze-frame → visibility_analyze.json under cwd: %s "
+		    "(same 0-based index as --save-depth-frame; use --max-frames ≥ index+1 when batching headless)\n",
 		    ecCwd ? "(current_path failed)" : cwd.generic_string().c_str());
 	}
 
 	Matr4f vpBench = fps.viewProj();
 	Vec3f camPosBench = fps.cam().position();
-	/// Batch N passes: always when headless+--max-frames; also when --save-depth-frame set (so dump
+	/// Batch N passes: always when headless+--max-frames; also when --save-depth-frame / --analyze-frame set (so dump
 	/// works without --headless — otherwise only pass 0 runs before GUI, frame K needs K+1 swaps).
-	if (maxFramesLimit > 0 && (headless || saveMocDepthFrame >= 0)) {
+	if (maxFramesLimit > 0 && (headless || saveMocDepthFrame >= 0 || analyzeFrame >= 0)) {
 		if (saveMocDepthFrame >= maxFramesLimit) {
 			std::fprintf(stderr,
 			    "ACCURACYBENCH: --save-depth-frame=%d >= --max-frames=%d (valid indices 0..%d); no save.\n",
 			    saveMocDepthFrame, maxFramesLimit, maxFramesLimit - 1);
+		}
+		if (analyzeFrame >= maxFramesLimit) {
+			std::fprintf(stderr,
+			    "ACCURACYBENCH: --analyze-frame=%d >= --max-frames=%d (valid indices 0..%d); no analyze output.\n",
+			    analyzeFrame, maxFramesLimit, maxFramesLimit - 1);
 		}
 		for (int f = 0; f < maxFramesLimit; ++f) {
 			Matr4f vpB = fps.viewProj();
@@ -2404,6 +2739,11 @@ int main(int argc, char **argv) {
 
 			double cx, cy;
 			glfwGetCursorPos(win, &cx, &cy);
+			/// Cursor lives in window coordinates; letterbox math uses framebuffer pixels (can differ on HiDPI).
+			int winClientW = 1, winClientH = 1;
+			glfwGetWindowSize(win, &winClientW, &winClientH);
+			const double cursFx = cx * double(winW) / double(std::max(winClientW, 1));
+			const double cursFy = cy * double(winH) / double(std::max(winClientH, 1));
 			float dx = 0.f, dy = 0.f;
 			if (haveCursor) {
 				dx = float(cx - lx);
@@ -2457,12 +2797,10 @@ int main(int argc, char **argv) {
 			};
 			bool leftClick = false;
 			double clickCx = 0.0, clickCy = 0.0;
-			int clickWx = 0, clickWy = 0;
 			if (mouseEdge(GLFW_MOUSE_BUTTON_LEFT, mbLeft)) {
 				leftClick = true;
-				clickCx = cx;
-				clickCy = cy;
-				glfwGetWindowPos(win, &clickWx, &clickWy);
+				clickCx = cursFx;
+				clickCy = cursFy;
 			}
 			if (edge(GLFW_KEY_P, kP)) {
 				Vec3f p = fps.cam().position();
@@ -2511,8 +2849,12 @@ int main(int argc, char **argv) {
 			const int oy = (winH - vh) / 2;
 			if (leftClick) {
 				if (clickCx >= ox && clickCx < ox + vw && clickCy >= oy && clickCy < oy + vh) {
-					const int fboX = std::min(fbW - 1, std::max(0, (int)((clickCx - ox) * fbW / vw)));
-					const int fboYTop = std::min(fbH - 1, std::max(0, (int)((clickCy - oy) * fbH / vh)));
+					const int fboX = std::min(fbW - 1,
+					    std::max(0,
+					        (int)std::lround((clickCx - ox) * double(fbW) / double(std::max(vw, 1)))));
+					const int fboYTop = std::min(fbH - 1,
+					    std::max(0,
+					        (int)std::lround((clickCy - oy) * double(fbH) / double(std::max(vh, 1)))));
 					const int fboY = fbH - 1 - fboYTop;
 					unsigned idPixel[4] = {};
 					glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -2520,11 +2862,9 @@ int main(int argc, char **argv) {
 					glReadPixels(fboX, fboY, 1, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, idPixel);
 					CheckGl("click object id readpixels");
 					glBindFramebuffer(GL_FRAMEBUFFER, 0);
-					printf("cursor screen: (%.0f, %.0f), object id: %u\n", clickWx + clickCx, clickWy + clickCy,
-					    idPixel[3]);
+					printf("pick %d %d id %u\n", fboX, fboYTop, idPixel[3]);
 				} else {
-					printf("cursor screen: (%.0f, %.0f), object id: 0 (outside viewport)\n", clickWx + clickCx,
-					    clickWy + clickCy);
+					printf("pick outside viewport\n");
 				}
 			}
 			glViewport(ox, oy, vw, vh);
