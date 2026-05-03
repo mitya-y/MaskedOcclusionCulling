@@ -1,5 +1,8 @@
 .cache/
 *.pdf
 *.png
+*.pfm
+*.json
+data.txt
 __pycache__/
 

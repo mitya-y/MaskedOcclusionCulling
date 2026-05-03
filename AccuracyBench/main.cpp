@@ -1308,7 +1308,9 @@ static bool ParseMaxFramesArg(const char *s, int &out, const char *flagName) {
 	return true;
 }
 
-/// `--save-depth-frame=N`: saves `depthN.png` (GL_DEPTH renderbuffer) + `moc_depthN.png` (MOC `ComputePixelDepthBuffer`).
+/// `--save-depth-frame=N`: saves GL depth + MOC `ComputePixelDepthBuffer` for pass N.
+/// Default: `depthN.pfm` + `moc_depthN.pfm` (IEEE float32 grayscale, Portable Float Map; 8-bit PNG cannot hold depth).
+/// `--tonemap-depth`: write `depthN.png` + `moc_depthN.png` instead (Intel-style linear map → gray 32…223).
 static bool ParseSaveDepthFrameArg(const char *s, int &out, const char *flagName) {
 	char *end = nullptr;
 	unsigned long v = std::strtoul(s, &end, 10);
@@ -1523,7 +1525,32 @@ static void TonemapGlDepthRbToRgb(const float *depthTopFirst, unsigned char *ima
 	}
 }
 
-/// Read `GL_DEPTH_COMPONENT` from current `GL_FRAMEBUFFER`, flip rows to top-first (PNG order).
+/// PFM grayscale: raster is bottom-first; `topFirstRowMajor` uses top-first (viewer's first row = y=0).
+/// Header scale negative ⇒ IEEE float32 little-endian (native on typical desktops).
+static bool WritePfmGrayF32FromTopFirst(const char *pathOut, int w, int h, const float *topFirstRowMajor) {
+	FILE *fp = std::fopen(pathOut, "wb");
+	if (!fp) {
+		std::fprintf(stderr, "fopen(wb) failed: %s\n", pathOut);
+		return false;
+	}
+	if (std::fprintf(fp, "Pf\n%d %d\n-1.0\n", w, h) < 0) {
+		std::fprintf(stderr, "fprintf header failed: %s\n", pathOut);
+		std::fclose(fp);
+		return false;
+	}
+	for (int y = h - 1; y >= 0; --y) {
+		const float *row = topFirstRowMajor + (size_t)y * (size_t)w;
+		if (std::fwrite(row, sizeof(float), (size_t)w, fp) != (size_t)w) {
+			std::fprintf(stderr, "fwrite failed: %s\n", pathOut);
+			std::fclose(fp);
+			return false;
+		}
+	}
+	std::fclose(fp);
+	return true;
+}
+
+/// Read `GL_DEPTH_COMPONENT` from current `GL_FRAMEBUFFER`, flip rows to top-first (PNG / viewer order).
 static bool SaveGlFbDepthTonemapPng(int w, int h, const char *pathOut) {
 	std::vector<float> bot((size_t)w * (size_t)h);
 	glReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, bot.data());
@@ -1541,6 +1568,18 @@ static bool SaveGlFbDepthTonemapPng(int w, int h, const char *pathOut) {
 	return true;
 }
 
+/// Full-precision float dump (PFM); values unchanged from GPU (clear=1.0, geometry in (0,1), non-finite possible).
+static bool SaveGlFbDepthRawPfm(int w, int h, const char *pathOut) {
+	std::vector<float> bot((size_t)w * (size_t)h);
+	glReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, bot.data());
+	CheckGl("readpixels depth for depth.pfm");
+	std::vector<float> top(bot.size());
+	for (int y = 0; y < h; ++y)
+		std::memcpy(top.data() + (size_t)y * (size_t)w, bot.data() + (size_t)(h - 1 - y) * (size_t)w,
+		    (size_t)w * sizeof(float));
+	return WritePfmGrayF32FromTopFirst(pathOut, w, h, top.data());
+}
+
 static constexpr char kAccbenchSaveDepthPrefix[] = "--save-depth-frame=";
 static constexpr char kAccbenchAnalyzeFramePrefix[] = "--analyze-frame=";
 
@@ -1556,6 +1595,12 @@ static bool SaveMocHizDepthPng(MaskedOcclusionCulling *moc, int w, int h, const 
 		return false;
 	}
 	return true;
+}
+
+static bool SaveMocHizDepthRawPfm(MaskedOcclusionCulling *moc, int w, int h, const char *pathOut) {
+	std::vector<float> depth((size_t)w * (size_t)h);
+	moc->ComputePixelDepthBuffer(depth.data(), true);
+	return WritePfmGrayF32FromTopFirst(pathOut, w, h, depth.data());
 }
 
 /// Read GL_COLOR_ATTACHMENT1 (R32F clip w); convert rows GL bottom-first → top-first rcpW for MOC ImportPixelDepthBuffer(..., true).
@@ -1589,8 +1634,10 @@ int main(int argc, char **argv) {
 	float clipFar = 1000.f;
 	/// 0: default (unbounded preview; headless: single benchmark pass).  N>0: see --max-frames=.
 	int maxFramesLimit = 0;
-	/// -1: off. Else save `depthN.png` + `moc_depthN.png` on pass N (0-based); see save block.
+	/// -1: off. Else save depth dumps on pass N (0-based): default `.pfm`, or `.png` if `tonemapDepth`.
 	int saveMocDepthFrame = -1;
+	/// With `--save-depth-frame`: false → IEEE float PFM; true → 8-bit RGB PNG tonemap (preview).
+	bool tonemapDepth = false;
 	/// -1: off. Else write `visibility_analyze.json` for pass index N (same numbering as --save-depth-frame).
 	int analyzeFrame = -1;
 	bool visualizeBounds = false;
@@ -1755,6 +1802,10 @@ int main(int argc, char **argv) {
 		}
 		if (!std::strcmp(argv[i], "--gpu-draw-always")) {
 			gpuDrawAlways = true;
+			continue;
+		}
+		if (!std::strcmp(argv[i], "--tonemap-depth") || !std::strcmp(argv[i], "--tonemape-depth")) {
+			tonemapDepth = true;
 			continue;
 		}
 		if (argv[i][0] != '-' && !objPath)
@@ -2130,25 +2181,37 @@ int main(int argc, char **argv) {
 				glFinish();
 			}
 			char pathGl[96];
-			std::snprintf(pathGl, sizeof(pathGl), "depth%d.png", passFrameIndex);
-			if (SaveGlFbDepthTonemapPng(fbW, fbH, pathGl)) {
+			if (tonemapDepth)
+				std::snprintf(pathGl, sizeof(pathGl), "depth%d.png", passFrameIndex);
+			else
+				std::snprintf(pathGl, sizeof(pathGl), "depth%d.pfm", passFrameIndex);
+			const bool okGl = tonemapDepth ? SaveGlFbDepthTonemapPng(fbW, fbH, pathGl)
+			                               : SaveGlFbDepthRawPfm(fbW, fbH, pathGl);
+			if (okGl) {
 				std::error_code ec;
 				const std::filesystem::path abs =
 				    std::filesystem::weakly_canonical(std::filesystem::path(pathGl), ec);
 				const std::string show =
 				    ec ? std::filesystem::absolute(std::filesystem::path(pathGl)).generic_string()
 				       : abs.generic_string();
-				std::fprintf(stderr, "Wrote GL depth buffer (tonemapped): %s\n", show.c_str());
+				std::fprintf(stderr, "Wrote GL depth buffer (%s): %s\n",
+				    tonemapDepth ? "tonemapped 8-bit PNG" : "raw float32 PFM", show.c_str());
 			}
 			char path[96];
-			std::snprintf(path, sizeof(path), "moc_depth%d.png", passFrameIndex);
-			if (SaveMocHizDepthPng(moc, fbW, fbH, path)) {
+			if (tonemapDepth)
+				std::snprintf(path, sizeof(path), "moc_depth%d.png", passFrameIndex);
+			else
+				std::snprintf(path, sizeof(path), "moc_depth%d.pfm", passFrameIndex);
+			const bool okMoc = tonemapDepth ? SaveMocHizDepthPng(moc, fbW, fbH, path)
+			                                : SaveMocHizDepthRawPfm(moc, fbW, fbH, path);
+			if (okMoc) {
 				std::error_code ec;
 				const std::filesystem::path abs =
 				    std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
 				const std::string show =
 				    ec ? std::filesystem::absolute(std::filesystem::path(path)).generic_string() : abs.generic_string();
-				std::fprintf(stderr, "Wrote MOC hierarchical-z → per-pixel depth (tonemapped): %s\n", show.c_str());
+				std::fprintf(stderr, "Wrote MOC per-pixel depth (%s): %s\n",
+				    tonemapDepth ? "tonemapped 8-bit PNG" : "raw float32 PFM", show.c_str());
 			}
 		}
 
@@ -2665,7 +2728,8 @@ int main(int argc, char **argv) {
 		std::error_code ecCwd;
 		const std::filesystem::path cwd = std::filesystem::current_path(ecCwd);
 		std::fprintf(stderr,
-		    "ACCURACYBENCH: --save-depth-frame → depth*.png + moc_depth*.png under cwd: %s\n",
+		    "ACCURACYBENCH: --save-depth-frame → depth* + moc_depth* (%s) under cwd: %s\n",
+		    tonemapDepth ? "PNG tonemap (--tonemap-depth)" : "PFM float32 (add --tonemap-depth for PNG preview)",
 		    ecCwd ? "(current_path failed)" : cwd.generic_string().c_str());
 	}
 
