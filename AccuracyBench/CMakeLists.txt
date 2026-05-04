@@ -68,7 +68,7 @@ endmacro()
 option(
 	ACCURACYBENCH_USE_MR_IMPORTER
 	"Link mr-importer for USD (OpenUSD). Requires Conan (or prefix) for mr-math + mr-importer. Conan preset turns this ON."
-	OFF
+	ON
 )
 set(
 	ACCURACYBENCH_CONAN_GENERATORS ""

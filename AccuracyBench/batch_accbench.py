@@ -4,7 +4,7 @@ Batch-run AccuracyBench: fixed list of (model, camera, clip), × dop k.
 
 Default: --headless --max-frames=30; last ACCBench line = stabilized metrics.
 
-CSV: scene_name, bound, camera, all, frustum, mocVis, gpuIds, mocBuf, mocQry, gpuDraw.
+CSV: scene_name, bound, camera, prev_frame_depth_mode, all, frustum, mocVis, gpuIds, mocBuf, mocQry, gpuDraw.
 bound: dop_k=0 -> aabb; dop_k=1 -> aabb-tri; else dop<K> (maps to moc flags as in C++). scene_name = "<id>_<bound>".
 Failed runs not written; errors only on stderr.
 
@@ -132,6 +132,7 @@ def main() -> int:
         "scene_name",
         "bound",
         "camera",
+        "prev_frame_depth_mode",
         "all",
         "frustum",
         "mocVis",
@@ -158,67 +159,75 @@ def main() -> int:
                     moc, bound = "aabb-tri", "aabb-tri"
                 else:
                     moc, bound = f"dop{dop_k}tri", f"dop{dop_k}"
-                argv: list[str] = [str(args.bench)]
-                if args.headless:
-                    argv.append("--headless")
-                argv.extend(
-                    [
-                        str(model),
-                        f"--camera={s.camera}",
-                        f"--near={s.near}",
-                        f"--far={s.far}",
-                        f"--moc-test={moc}",
-                        f"--max-frames={args.max_frames}",
-                    ]
-                )
-
-                if args.dry_run:
-                    print(" ".join(shlex.quote(x) for x in argv))
-                    continue
-
-                try:
-                    proc = subprocess.run(
-                        argv,
-                        capture_output=True,
-                        text=True,
-                        timeout=args.timeout,
-                        check=False,
+                for use_prev_frame_depth in (False, True):
+                    mode_label = "without-prev-frame-depth" if not use_prev_frame_depth else "with-prev-frame-depth"
+                    argv: list[str] = [str(args.bench)]
+                    if args.headless:
+                        argv.append("--headless")
+                    if use_prev_frame_depth:
+                        argv.append("--use-prev-frame-depth")
+                    argv.extend(
+                        [
+                            str(model),
+                            f"--camera={s.camera}",
+                            f"--near={s.near}",
+                            f"--far={s.far}",
+                            f"--moc-test={moc}",
+                            f"--max-frames={args.max_frames}",
+                        ]
                     )
-                except subprocess.TimeoutExpired:
-                    n_fail += 1
-                    print(f"TIMEOUT {s.scene_id} cam{camera_index} {moc}", file=sys.stderr)
-                    continue
 
-                err = proc.stderr or ""
-                out = proc.stdout or ""
-                combined = err + "\n" + out
-                m = last_accbench_match(combined)
-                if proc.returncode != 0 or not m:
-                    n_fail += 1
-                    note = " no_ACCBench_stderr_rebuild?" if proc.returncode == 0 and not m else ""
-                    print(
-                        f"FAIL rc={proc.returncode} {s.scene_id} cam{camera_index} {moc}{note}",
-                        file=sys.stderr,
+                    if args.dry_run:
+                        print(" ".join(shlex.quote(x) for x in argv))
+                        continue
+
+                    try:
+                        proc = subprocess.run(
+                            argv,
+                            capture_output=True,
+                            text=True,
+                            timeout=args.timeout,
+                            check=False,
+                        )
+                    except subprocess.TimeoutExpired:
+                        n_fail += 1
+                        print(
+                            f"TIMEOUT {s.scene_id} cam{camera_index} {moc} {mode_label}",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    err = proc.stderr or ""
+                    out = proc.stdout or ""
+                    combined = err + "\n" + out
+                    m = last_accbench_match(combined)
+                    if proc.returncode != 0 or not m:
+                        n_fail += 1
+                        note = " no_ACCBench_stderr_rebuild?" if proc.returncode == 0 and not m else ""
+                        print(
+                            f"FAIL rc={proc.returncode} {s.scene_id} cam{camera_index} {moc} {mode_label}{note}",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    g = m.groupdict()
+                    w.writerow(
+                        {
+                            "scene_name": f"{s.scene_id}_{bound}",
+                            "bound": bound,
+                            "camera": s.camera,
+                            "prev_frame_depth_mode": mode_label,
+                            "all": g["all"],
+                            "frustum": g["frustum"],
+                            "mocVis": g["mocVis"],
+                            "gpuIds": g["gpuIds"],
+                            "mocBuf": g["mocBuf"],
+                            "mocQry": g["mocQry"],
+                            "gpuDraw": g["gpuDraw"],
+                        }
                     )
-                    continue
-
-                g = m.groupdict()
-                w.writerow(
-                    {
-                        "scene_name": f"{s.scene_id}_{bound}",
-                        "bound": bound,
-                        "camera": s.camera,
-                        "all": g["all"],
-                        "frustum": g["frustum"],
-                        "mocVis": g["mocVis"],
-                        "gpuIds": g["gpuIds"],
-                        "mocBuf": g["mocBuf"],
-                        "mocQry": g["mocQry"],
-                        "gpuDraw": g["gpuDraw"],
-                    }
-                )
-                fcsv.flush()
-                n_ok += 1
+                    fcsv.flush()
+                    n_ok += 1
 
     if not args.dry_run:
         print(f"Wrote {args.out}  ok={n_ok}  fail={n_fail}", file=sys.stderr)

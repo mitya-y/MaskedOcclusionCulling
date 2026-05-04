@@ -1311,7 +1311,7 @@ static bool ParseMaxFramesArg(const char *s, int &out, const char *flagName) {
 /// `--save-depth-frame=N`: saves GL depth + MOC `ComputePixelDepthBuffer` for pass N.
 /// Default: `depthN.pfm` + `moc_depthN.pfm` (IEEE float32 grayscale, Portable Float Map; 8-bit PNG cannot hold depth).
 /// `--tonemap-depth`: write `depthN.png` + `moc_depthN.png` instead (Intel-style linear map → gray 32…223).
-/// With `--use-prev-frame-prev`: also `wdepthN.*` = clip **w** from `COLOR_ATTACHMENT1`; `invwdepthN.*` = **1/w**
+/// With `--use-prev-frame-depth`: also `wdepthN.*` = clip **w** from `COLOR_ATTACHMENT1`; `invwdepthN.*` = **1/w**
 /// (same array as `ImportPixelDepthBuffer`).
 static bool ParseSaveDepthFrameArg(const char *s, int &out, const char *flagName) {
 	char *end = nullptr;
@@ -1874,7 +1874,7 @@ int main(int argc, char **argv) {
 			visualizeBoundProjection = true;
 			continue;
 		}
-		if (!std::strcmp(argv[i], "--use-prev-frame-prev")) {
+		if (!std::strcmp(argv[i], "--use-prev-frame-depth")) {
 			usePrevFramePrev = true;
 			continue;
 		}
@@ -1897,7 +1897,7 @@ int main(int argc, char **argv) {
 	}
 	if (usePrevFramePrev) {
 		std::fprintf(stderr,
-		    "ACCURACYBENCH: --use-prev-frame-prev → GPU draw all frustum first → ImportPixelDepthBuffer from clip.w "
+		    "ACCURACYBENCH: --use-prev-frame-depth → GPU draw all frustum first → ImportPixelDepthBuffer from clip.w "
 		    "(~1/w).\n");
 		if (!gpuDrawAlways)
 			std::fprintf(stderr,
@@ -2253,7 +2253,7 @@ int main(int argc, char **argv) {
 
 		if (saveMocDepthFrame >= 0 && passFrameIndex == saveMocDepthFrame) {
 			glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-			/// `--use-prev-frame-prev`: depth already valid from pass-start draw; else rasterize full frustum once.
+			/// `--use-prev-frame-depth`: depth already valid from pass-start draw; else rasterize full frustum once.
 			if (!usePrevFramePrev) {
 				drawGpuReferenceFill(vp, nullptr);
 				glFinish();
@@ -2813,17 +2813,12 @@ int main(int argc, char **argv) {
 		/// No GUI in this path; 10)guiFrame= is 0.0. Omit when not headless so the window path does not double-print.
 		if (headless && maxFramesLimit > 0) {
 			const double guiFrameMs = 0.0;
-			const unsigned agr = result.agreeVisFrustum;
-			const bool inv =
-			    (agr + result.fp == result.nMocVisible) && (agr + result.fn == result.nGpuVisible) &&
-			    ((int)result.nGpuVisible - (int)result.nMocVisible == (int)result.fn - (int)result.fp);
 			std::fprintf(stderr,
-			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  agr=%u fp=%u fn=%u  stat=%s  "
+			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
 			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
 			    "10)guiFrame=%.3fms\n",
-			    result.nAll, result.nFrustum, result.nMocVisible, result.nGpuVisible, agr, result.fp, result.fn,
-			    inv ? "ok" : "BUG", result.mocBufferMs, result.mocQueryMs, result.gpuRefMs, result.readPixelsMs,
-			    result.passWallMs, guiFrameMs);
+			    result.nAll, result.nFrustum, result.nMocVisible, result.nGpuVisible, result.mocBufferMs,
+			    result.mocQueryMs, result.gpuRefMs, result.readPixelsMs, result.passWallMs, guiFrameMs);
 			std::fflush(stderr);
 		}
 
@@ -2849,7 +2844,7 @@ int main(int argc, char **argv) {
 		    ecCwd ? "(current_path failed)" : cwd.generic_string().c_str());
 		if (usePrevFramePrev)
 			std::fprintf(stderr,
-			    "ACCURACYBENCH: --use-prev-frame-prev → also wdepth* + invwdepth* (clip.w resp. 1/w Import buffer)\n");
+			    "ACCURACYBENCH: --use-prev-frame-depth → also wdepth* + invwdepth* (clip.w resp. 1/w Import buffer)\n");
 	}
 
 	if (analyzeFrame >= 0) {
@@ -3226,15 +3221,12 @@ int main(int argc, char **argv) {
 			const double guiFrameMs =
 			    std::chrono::duration<double, std::milli>(tGuiFrame1 - tGuiFrame0).count();
 			{
-				const unsigned agr = br.agreeVisFrustum;
-				const bool inv = (agr + br.fp == br.nMocVisible) && (agr + br.fn == br.nGpuVisible) &&
-				    ((int)br.nGpuVisible - (int)br.nMocVisible == (int)br.fn - (int)br.fp);
 				std::fprintf(stderr,
-				    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  agr=%u fp=%u fn=%u  stat=%s  "
+				    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
 				    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
 				    "10)guiFrame=%.3fms\n",
-				    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, agr, br.fp, br.fn, inv ? "ok" : "BUG",
-				    br.mocBufferMs, br.mocQueryMs, br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
+				    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, br.mocBufferMs, br.mocQueryMs,
+				    br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
 			}
 			std::fflush(stderr);
 			guiPrevMocVisibleForOverlay.assign(guiBenchMocVisible.begin(), guiBenchMocVisible.end());
