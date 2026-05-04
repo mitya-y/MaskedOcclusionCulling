@@ -1311,6 +1311,8 @@ static bool ParseMaxFramesArg(const char *s, int &out, const char *flagName) {
 /// `--save-depth-frame=N`: saves GL depth + MOC `ComputePixelDepthBuffer` for pass N.
 /// Default: `depthN.pfm` + `moc_depthN.pfm` (IEEE float32 grayscale, Portable Float Map; 8-bit PNG cannot hold depth).
 /// `--tonemap-depth`: write `depthN.png` + `moc_depthN.png` instead (Intel-style linear map → gray 32…223).
+/// With `--use-prev-frame-prev`: also `wdepthN.*` = clip **w** from `COLOR_ATTACHMENT1`; `invwdepthN.*` = **1/w**
+/// (same array as `ImportPixelDepthBuffer`).
 static bool ParseSaveDepthFrameArg(const char *s, int &out, const char *flagName) {
 	char *end = nullptr;
 	unsigned long v = std::strtoul(s, &end, 10);
@@ -1578,6 +1580,82 @@ static bool SaveGlFbDepthRawPfm(int w, int h, const char *pathOut) {
 		std::memcpy(top.data() + (size_t)y * (size_t)w, bot.data() + (size_t)(h - 1 - y) * (size_t)w,
 		    (size_t)w * sizeof(float));
 	return WritePfmGrayF32FromTopFirst(pathOut, w, h, top.data());
+}
+
+/// `COLOR_ATTACHMENT1` clip **w** (R32F), top-first; same buffer `AccBenchReadClipWToTopFirstRcpW` inverts for Import.
+static bool SaveGlClipWRawPfm(int w, int h, const char *pathOut) {
+	std::vector<float> bot((size_t)w * (size_t)h);
+	glReadBuffer(GL_COLOR_ATTACHMENT1);
+	glReadPixels(0, 0, w, h, GL_RED, GL_FLOAT, bot.data());
+	CheckGl("readpixels clip w for wdepth.pfm");
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	std::vector<float> top(bot.size());
+	for (int y = 0; y < h; ++y)
+		std::memcpy(top.data() + (size_t)y * (size_t)w, bot.data() + (size_t)(h - 1 - y) * (size_t)w,
+		    (size_t)w * sizeof(float));
+	return WritePfmGrayF32FromTopFirst(pathOut, w, h, top.data());
+}
+
+static bool SaveGlClipWTonemapPng(int w, int h, const char *pathOut) {
+	std::vector<float> bot((size_t)w * (size_t)h);
+	glReadBuffer(GL_COLOR_ATTACHMENT1);
+	glReadPixels(0, 0, w, h, GL_RED, GL_FLOAT, bot.data());
+	CheckGl("readpixels clip w for wdepth.png");
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	std::vector<float> top(bot.size());
+	for (int y = 0; y < h; ++y)
+		std::memcpy(top.data() + (size_t)y * (size_t)w, bot.data() + (size_t)(h - 1 - y) * (size_t)w,
+		    (size_t)w * sizeof(float));
+	std::vector<unsigned char> rgb((size_t)w * (size_t)h * 3);
+	TonemapMocDepthToRgb(top.data(), rgb.data(), w, h);
+	if (!stbi_write_png(pathOut, w, h, 3, rgb.data(), w * 3)) {
+		std::fprintf(stderr, "stbi_write_png failed: %s\n", pathOut);
+		return false;
+	}
+	return true;
+}
+
+/// Top-first **1/w** (rcpW), bitwise same rule as `AccBenchReadClipWToTopFirstRcpW` / `ImportPixelDepthBuffer` input.
+static bool SaveGlClipInvWRawPfm(int w, int h, const char *pathOut) {
+	std::vector<float> bot((size_t)w * (size_t)h);
+	glReadBuffer(GL_COLOR_ATTACHMENT1);
+	glReadPixels(0, 0, w, h, GL_RED, GL_FLOAT, bot.data());
+	CheckGl("readpixels clip w for invwdepth.pfm");
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	std::vector<float> top((size_t)w * (size_t)h);
+	for (int y = 0; y < h; ++y) {
+		const float *srcRow = bot.data() + (size_t)(h - 1 - y) * (size_t)w;
+		float *dstRow = top.data() + (size_t)y * (size_t)w;
+		for (int x = 0; x < w; ++x) {
+			const float cw = srcRow[x];
+			dstRow[x] = (std::isfinite(cw) && cw > 1e-8f) ? (1.f / cw) : 0.f;
+		}
+	}
+	return WritePfmGrayF32FromTopFirst(pathOut, w, h, top.data());
+}
+
+static bool SaveGlClipInvWTonemapPng(int w, int h, const char *pathOut) {
+	std::vector<float> bot((size_t)w * (size_t)h);
+	glReadBuffer(GL_COLOR_ATTACHMENT1);
+	glReadPixels(0, 0, w, h, GL_RED, GL_FLOAT, bot.data());
+	CheckGl("readpixels clip w for invwdepth.png");
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	std::vector<float> top((size_t)w * (size_t)h);
+	for (int y = 0; y < h; ++y) {
+		const float *srcRow = bot.data() + (size_t)(h - 1 - y) * (size_t)w;
+		float *dstRow = top.data() + (size_t)y * (size_t)w;
+		for (int x = 0; x < w; ++x) {
+			const float cw = srcRow[x];
+			dstRow[x] = (std::isfinite(cw) && cw > 1e-8f) ? (1.f / cw) : 0.f;
+		}
+	}
+	std::vector<unsigned char> rgb((size_t)w * (size_t)h * 3);
+	TonemapMocDepthToRgb(top.data(), rgb.data(), w, h);
+	if (!stbi_write_png(pathOut, w, h, 3, rgb.data(), w * 3)) {
+		std::fprintf(stderr, "stbi_write_png failed: %s\n", pathOut);
+		return false;
+	}
+	return true;
 }
 
 static constexpr char kAccbenchSaveDepthPrefix[] = "--save-depth-frame=";
@@ -2213,6 +2291,44 @@ int main(int argc, char **argv) {
 				std::fprintf(stderr, "Wrote MOC per-pixel depth (%s): %s\n",
 				    tonemapDepth ? "tonemapped 8-bit PNG" : "raw float32 PFM", show.c_str());
 			}
+			if (usePrevFramePrev) {
+				char pathW[96];
+				if (tonemapDepth)
+					std::snprintf(pathW, sizeof(pathW), "wdepth%d.png", passFrameIndex);
+				else
+					std::snprintf(pathW, sizeof(pathW), "wdepth%d.pfm", passFrameIndex);
+				const bool okW = tonemapDepth ? SaveGlClipWTonemapPng(fbW, fbH, pathW)
+				                              : SaveGlClipWRawPfm(fbW, fbH, pathW);
+				if (okW) {
+					std::error_code ec;
+					const std::filesystem::path abs =
+					    std::filesystem::weakly_canonical(std::filesystem::path(pathW), ec);
+					const std::string show =
+					    ec ? std::filesystem::absolute(std::filesystem::path(pathW)).generic_string()
+					       : abs.generic_string();
+					std::fprintf(stderr,
+					    "Wrote GPU clip.w attachment (%s; MOC Import uses 1/w): %s\n",
+					    tonemapDepth ? "tonemapped 8-bit PNG" : "raw float32 PFM", show.c_str());
+				}
+				char pathInvW[96];
+				if (tonemapDepth)
+					std::snprintf(pathInvW, sizeof(pathInvW), "invwdepth%d.png", passFrameIndex);
+				else
+					std::snprintf(pathInvW, sizeof(pathInvW), "invwdepth%d.pfm", passFrameIndex);
+				const bool okInvW = tonemapDepth ? SaveGlClipInvWTonemapPng(fbW, fbH, pathInvW)
+				                                 : SaveGlClipInvWRawPfm(fbW, fbH, pathInvW);
+				if (okInvW) {
+					std::error_code ec;
+					const std::filesystem::path abs =
+					    std::filesystem::weakly_canonical(std::filesystem::path(pathInvW), ec);
+					const std::string show =
+					    ec ? std::filesystem::absolute(std::filesystem::path(pathInvW)).generic_string()
+					       : abs.generic_string();
+					std::fprintf(stderr,
+					    "Wrote 1/clip.w for ImportPixelDepthBuffer (%s): %s\n",
+					    tonemapDepth ? "tonemapped 8-bit PNG" : "raw float32 PFM", show.c_str());
+				}
+			}
 		}
 
 		const unsigned nAll = (unsigned)objects.size();
@@ -2731,6 +2847,9 @@ int main(int argc, char **argv) {
 		    "ACCURACYBENCH: --save-depth-frame → depth* + moc_depth* (%s) under cwd: %s\n",
 		    tonemapDepth ? "PNG tonemap (--tonemap-depth)" : "PFM float32 (add --tonemap-depth for PNG preview)",
 		    ecCwd ? "(current_path failed)" : cwd.generic_string().c_str());
+		if (usePrevFramePrev)
+			std::fprintf(stderr,
+			    "ACCURACYBENCH: --use-prev-frame-prev → also wdepth* + invwdepth* (clip.w resp. 1/w Import buffer)\n");
 	}
 
 	if (analyzeFrame >= 0) {
