@@ -37,7 +37,7 @@ void MaskedOcclusionCullingFromDepthPrivate::ImportPixelDepthBuffer(const float 
 			{
 				const int sty = lane / 4;
 				const int stx = lane % 4;
-				float maxZ = -1.f;
+				float minZ = FLT_MAX;
 				int validCnt = 0;
 
 				for (int py = 0; py < SUB_TILE_HEIGHT; py++)
@@ -51,8 +51,8 @@ void MaskedOcclusionCullingFromDepthPrivate::ImportPixelDepthBuffer(const float 
 						const float z = sample(x, y);
 						if (z > 0.f && z == z && z < FLT_MAX)
 						{
-							if (validCnt == 0 || z > maxZ)
-								maxZ = z;
+							if (validCnt == 0 || z < minZ)
+								minZ = z;
 							++validCnt;
 						}
 					}
@@ -69,7 +69,7 @@ void MaskedOcclusionCullingFromDepthPrivate::ImportPixelDepthBuffer(const float 
 				}
 				else
 				{
-					simd_f32(tile.mZMin[0])[lane] = maxZ;
+					simd_f32(tile.mZMin[0])[lane] = minZ;
 #if QUICK_MASK != 0
 					simd_f32(tile.mZMin[1])[lane] = FLT_MAX;
 #else
