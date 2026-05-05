@@ -952,13 +952,14 @@ static bool BuildConvexHull2D(const std::vector<NdcPoint2f> &points, std::vector
 }
 
 static bool BuildClipFanFromHull(
-    const std::vector<NdcPoint2f> &hull, float wRef, std::vector<float> &outClipVerts,
+    const std::vector<NdcPoint2f> &hull, float wRef, float nearClipW, std::vector<float> &outClipVerts,
     std::vector<unsigned> &outTris) {
 	outClipVerts.clear();
 	outTris.clear();
 	if (hull.size() < 3)
 		return false;
-	const float wSafe = std::max(wRef, 1e-4f);
+	// Fan vertices are synthetic clip-space points; keep their w within active clip volume.
+	const float wSafe = std::max(std::max(wRef, nearClipW), 1e-4f);
 	outClipVerts.reserve(hull.size() * 4);
 	for (const NdcPoint2f &p : hull) {
 		outClipVerts.push_back(p.x * wSafe);
@@ -2409,7 +2410,7 @@ int main(int argc, char **argv) {
 					if (BuildConvexHull2D(ndcPoints, hull)) {
 						std::vector<float> clipVerts;
 						std::vector<unsigned> triIdx;
-						if (BuildClipFanFromHull(hull, wRef, clipVerts, triIdx)) {
+						if (BuildClipFanFromHull(hull, wRef, nearP, clipVerts, triIdx)) {
 							occPath = "aabb_tri";
 							occlusionQueryExecuted = true;
 							r = moc->TestTriangles(
@@ -2490,7 +2491,7 @@ int main(int argc, char **argv) {
 						if (BuildConvexHull2D(ndcPoints, hull)) {
 							std::vector<float> clipVerts;
 							std::vector<unsigned> triIdx;
-							if (BuildClipFanFromHull(hull, wRef, clipVerts, triIdx)) {
+							if (BuildClipFanFromHull(hull, wRef, nearP, clipVerts, triIdx)) {
 								occPath = "dop_tri";
 								occlusionQueryExecuted = true;
 								r = moc->TestTriangles(
@@ -2944,7 +2945,7 @@ int main(int argc, char **argv) {
 
 			// Same normalization as mr::graphics Scene::update (mouse delta / extent, minus Y for screen space).
 			Vec3f angularDelta{dx / float(std::max(winW, 1)), -dy / float(std::max(winH, 1)), 0.f};
-			// fps.turn(angularDelta);
+			fps.turn(angularDelta);
 
 			float speedup = glfwGetKey(win, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ? 10.f : 1.f;
 			if (glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS)
