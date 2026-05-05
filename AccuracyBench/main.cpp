@@ -2109,6 +2109,8 @@ int main(int argc, char **argv) {
 		double gpuRefMs = 0;
 		/// glReadPixels RGBA32UI readback (benchmark ground-truth fetch).
 		double readPixelsMs = 0;
+		/// Depth read from COLOR_ATTACHMENT1 clip.w for ImportPixelDepthBuffer; 0 when disabled.
+		double depthReadMs = 0;
 		/// Wall time: Create → after FP/FN stats (excludes printf / Destroy).
 		double passWallMs = 0;
 	};
@@ -2173,6 +2175,7 @@ int main(int argc, char **argv) {
 
 		double gpuRefMs = 0.0;
 		double mocBufferMs = 0.0;
+		double depthReadMs = 0.0;
 
 		float mvpCol[16];
 
@@ -2185,7 +2188,10 @@ int main(int argc, char **argv) {
 			gpuRefMs = std::chrono::duration<double, std::milli>(tGpuRef1 - tGpuRef0).count();
 
 			const auto tMocBuffer0 = std::chrono::steady_clock::now();
+			const auto tDepthRead0 = std::chrono::steady_clock::now();
 			AccBenchReadClipWToTopFirstRcpW(fbW, fbH, gpuClipScratchRcpW);
+			const auto tDepthRead1 = std::chrono::steady_clock::now();
+			depthReadMs = std::chrono::duration<double, std::milli>(tDepthRead1 - tDepthRead0).count();
 			moc->ClearBuffer();
 			moc->ImportPixelDepthBuffer(gpuClipScratchRcpW.data(), true);
 			const auto tMocBuffer1 = std::chrono::steady_clock::now();
@@ -2679,6 +2685,7 @@ int main(int argc, char **argv) {
 		result.mocQueryMs = mocQueryMs;
 		result.gpuRefMs = gpuRefMs;
 		result.readPixelsMs = readPixelsMs;
+		result.depthReadMs = depthReadMs;
 		result.passWallMs = passWallMs;
 
 		if (printStyle == BenchPrintStyle::Full) {
@@ -2811,15 +2818,16 @@ int main(int argc, char **argv) {
 		}
 
 		/// Same one-line summary as the interactive preview loop (stderr), for headless --max-frames= batching.
-		/// No GUI in this path; 10)guiFrame= is 0.0. Omit when not headless so the window path does not double-print.
+		/// No GUI in this path; 11)guiFrame= is 0.0. Omit when not headless so the window path does not double-print.
 		if (headless && maxFramesLimit > 0) {
 			const double guiFrameMs = 0.0;
 			std::fprintf(stderr,
 			    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
 			    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
-			    "10)guiFrame=%.3fms\n",
+			    "10)depthRead=%.3fms  11)guiFrame=%.3fms\n",
 			    result.nAll, result.nFrustum, result.nMocVisible, result.nGpuVisible, result.mocBufferMs,
-			    result.mocQueryMs, result.gpuRefMs, result.readPixelsMs, result.passWallMs, guiFrameMs);
+			    result.mocQueryMs, result.gpuRefMs, result.readPixelsMs, result.passWallMs, result.depthReadMs,
+			    guiFrameMs);
 			std::fflush(stderr);
 		}
 
@@ -2888,7 +2896,7 @@ int main(int argc, char **argv) {
 		    "no depth writes). `--visualize-bound-projection` draws NDC hull (yellow); alias `--visualize-bounds-projection`. "
 		    "Both only for objects MOC-visible this frame or last frame.\n");
 		printf("Live stats on stderr: counts + MOC build / query + GPU draw + readPixels + pass wall + "
-		       "full GUI frame (ms), every iteration.\n");
+		       "depth read (clip.w import path) + full GUI frame (ms), every iteration.\n");
 		if (maxFramesLimit > 0)
 			printf("Exiting after %d preview frame(s) (--max-frames); you can also close the window to quit early.\n",
 			    maxFramesLimit);
@@ -3225,9 +3233,9 @@ int main(int argc, char **argv) {
 				std::fprintf(stderr,
 				    "ACCBench  1)all=%u  2)frustum=%u  3)mocVis=%u  4)gpuIds=%u  "
 				    "5)mocBuf=%.3fms  6)mocQry=%.3fms  7)gpuDraw=%.3fms  8)readPx=%.3fms  9)passWall=%.3fms  "
-				    "10)guiFrame=%.3fms\n",
+				    "10)depthRead=%.3fms  11)guiFrame=%.3fms\n",
 				    br.nAll, br.nFrustum, br.nMocVisible, br.nGpuVisible, br.mocBufferMs, br.mocQueryMs,
-				    br.gpuRefMs, br.readPixelsMs, br.passWallMs, guiFrameMs);
+				    br.gpuRefMs, br.readPixelsMs, br.passWallMs, br.depthReadMs, guiFrameMs);
 			}
 			std::fflush(stderr);
 			guiPrevMocVisibleForOverlay.assign(guiBenchMocVisible.begin(), guiBenchMocVisible.end());

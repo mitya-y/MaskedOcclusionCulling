@@ -4,8 +4,8 @@ Batch-run AccuracyBench: fixed list of (model, camera, clip), × dop k.
 
 Default: --headless --max-frames=30; last ACCBench line = stabilized metrics.
 
-CSV: scene_name, bound, camera, prev_frame_depth_mode, all, frustum, mocVis, gpuIds, mocBuf, mocQry, gpuDraw.
-bound: dop_k=0 -> aabb; dop_k=1 -> aabb-tri; else dop<K> (maps to moc flags as in C++). scene_name = "<id>_<bound>".
+CSV: scene_name, bound, camera, prev_frame_depth_mode, all, frustum, mocVis, gpuIds, mocBuf, mocQry, gpuDraw, depthRead.
+bound: dop_k=0 -> aabb; dop_k=1 -> aabb-tri; else dop<K> (maps to moc flags as in C++). scene_name = "<scene>_<camera_hash8>".
 Failed runs not written; errors only on stderr.
 
   ./batch_accbench.py --bench ./build/Release/AccuracyBench \\
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import re
 import shlex
 import subprocess
@@ -26,7 +27,7 @@ from pathlib import Path
 # Use [^\s]+ for *ms values: prints may be float, nan, inf (old [\d.]+ failed on NaN)
 ACCBENCH_RE = re.compile(
     r"ACCBench\s+1\)all=(?P<all>\d+)\s+2\)frustum=(?P<frustum>\d+)\s+3\)mocVis=(?P<mocVis>\d+)\s+4\)gpuIds=(?P<gpuIds>\d+)\s+"
-    r"5\)mocBuf=(?P<mocBuf>[^\s]+)ms\s+6\)mocQry=(?P<mocQry>[^\s]+)ms\s+7\)gpuDraw=(?P<gpuDraw>[^\s]+)ms\s+8\)readPx=(?P<readPx>[^\s]+)ms\s+9\)passWall=(?P<passWall>[^\s]+)ms\s+10\)guiFrame=(?P<guiFrame>[^\s]+)ms"
+    r"5\)mocBuf=(?P<mocBuf>[^\s]+)ms\s+6\)mocQry=(?P<mocQry>[^\s]+)ms\s+7\)gpuDraw=(?P<gpuDraw>[^\s]+)ms\s+8\)readPx=(?P<readPx>[^\s]+)ms\s+9\)passWall=(?P<passWall>[^\s]+)ms\s+10\)depthRead=(?P<depthRead>[^\s]+)ms\s+11\)guiFrame=(?P<guiFrame>[^\s]+)ms"
 )
 
 
@@ -102,6 +103,10 @@ def last_accbench_match(text: str) -> re.Match | None:
     return last
 
 
+def camera_hash8(scene_id: str, camera: str) -> str:
+    return hashlib.sha1(f"{scene_id}|{camera}".encode("utf-8")).hexdigest()[:8]
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bench", type=Path, default=Path("./build/Release/AccuracyBench"), help="AccuracyBench binary")
@@ -140,6 +145,7 @@ def main() -> int:
         "mocBuf",
         "mocQry",
         "gpuDraw",
+        "depthRead",
     ]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -152,15 +158,16 @@ def main() -> int:
 
         for camera_index, s in enumerate(BENCH_SCENES):
             model = resolve_model_path(s, args.assets_base)
-            for dop_k in dop_ks:
-                if dop_k == 0:
-                    moc, bound = "aabb", "aabb"
-                elif dop_k == 1:
-                    moc, bound = "aabb-tri", "aabb-tri"
-                else:
-                    moc, bound = f"dop{dop_k}tri", f"dop{dop_k}"
-                for use_prev_frame_depth in (False, True):
-                    mode_label = "without-prev-frame-depth" if not use_prev_frame_depth else "with-prev-frame-depth"
+            scene_name = f"{s.scene_id}_{camera_hash8(s.scene_id, s.camera)}"
+            for use_prev_frame_depth in (False, True):
+                mode_label = "without-prev-frame-depth" if not use_prev_frame_depth else "with-prev-frame-depth"
+                for dop_k in dop_ks:
+                    if dop_k == 0:
+                        moc, bound = "aabb", "aabb"
+                    elif dop_k == 1:
+                        moc, bound = "aabb-tri", "aabb-tri"
+                    else:
+                        moc, bound = f"dop{dop_k}tri", f"dop{dop_k}"
                     argv: list[str] = [str(args.bench)]
                     if args.headless:
                         argv.append("--headless")
@@ -213,7 +220,7 @@ def main() -> int:
                     g = m.groupdict()
                     w.writerow(
                         {
-                            "scene_name": f"{s.scene_id}_{bound}",
+                            "scene_name": scene_name,
                             "bound": bound,
                             "camera": s.camera,
                             "prev_frame_depth_mode": mode_label,
@@ -224,6 +231,7 @@ def main() -> int:
                             "mocBuf": g["mocBuf"],
                             "mocQry": g["mocQry"],
                             "gpuDraw": g["gpuDraw"],
+                            "depthRead": g["depthRead"],
                         }
                     )
                     fcsv.flush()
