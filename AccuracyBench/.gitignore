@@ -3,6 +3,7 @@
 *.png
 *.pfm
 *.json
+*.csv
 data.txt
 __pycache__/
 

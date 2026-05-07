@@ -1698,6 +1698,73 @@ static void AccBenchReadClipWToTopFirstRcpW(int w, int h, std::vector<float> &ou
 	}
 }
 
+/// `-h`: compact flag list. `--help`: same semantics explained + example (stderr messages stay English).
+static void PrintAccBenchHelpShort(FILE *out, const char *prog) {
+	std::fprintf(out,
+	    "Usage: %s [options] <model.(glb|gltf|usd|obj)>\n"
+	    "\n"
+	    "Options:\n"
+	    "  -h\n"
+	    "  --help\n"
+	    "  --headless\n"
+	    "  --per-object\n"
+	    "  --moc-test=<mesh|aabb|aabb-tri|dop<K>|dop<K>tri|dop26|dop26tri>   (K even, 10…30)\n"
+	    "  --resolution=<WxH>\n"
+	    "  --resolution <WxH>\n"
+	    "  --resoltuion=<WxH>                         (typo alias for --resolution)\n"
+	    "  --camera=<spec>\n"
+	    "  --camera <spec>\n"
+	    "  --near=<float>\n"
+	    "  --near <float>\n"
+	    "  --far=<float>\n"
+	    "  --far <float>\n"
+	    "  --max-frames=<N>\n"
+	    "  --max-frames <N>\n"
+	    "  --save-depth-frame=<pass>\n"
+	    "  --save-depth-frame <pass>                (0 = first benchmark pass)\n"
+	    "  --analyze-frame=<pass>\n"
+	    "  --analyze-frame <pass>\n"
+	    "  --visualize-bounds\n"
+	    "  --visualize-bound-projection | --visualize-bounds-projection\n"
+	    "  --use-prev-frame-depth\n"
+	    "  --gpu-draw-always\n"
+	    "  --tonemap-depth | --tonemape-depth       (typo alias)\n"
+	    "\n"
+	    "Env: ACCURACYBENCH_MOC_TEST Same syntax as --moc-test= when flag omitted.\n",
+	    prog);
+}
+
+static void PrintAccBenchHelpLong(FILE *out, const char *prog) {
+	PrintAccBenchHelpShort(out, prog);
+	std::fprintf(out,
+	    "\n"
+	    "What flags do (short):\n"
+	    "  -h              Compact list only.\n"
+	    "  --help          This text.\n"
+	    "  --headless      No GLFW window: run benchmark pass(es), print ACCBench lines, exit.\n"
+	    "  --per-object    Print per-instance summary (frustum / MOC / GPU id readback).\n"
+	    "  --moc-test      Occludee bounds test: full mesh, AABB rect, AABB hull, or k-DOP in NDC "
+	    "(even k 10…30; aliases dop26 / dop26tri).\n"
+	    "  --resolution    Framebuffer size for MOC + draws (snapped to implementation constraints).\n"
+	    "  --camera        Camera pose string ((eye),(forward),(up)) — same format as batch runner.\n"
+	    "  --near, --far   Perspective clip planes for loaded scene.\n"
+	    "  --max-frames    After N benchmark frames, quit (last ACCBench line = stabilized timing).\n"
+	    "  --save-depth-frame   Dump MOC Hi-Z depth on pass index N (PFM, or PNG if --tonemap-depth).\n"
+	    "  --analyze-frame Write visibility_analyze.json on pass N (same index basis as save-depth).\n"
+	    "  --visualize-bounds / --visualize-bound-projection   Debug overlays (need window; ignored "
+	    "with --headless).\n"
+	    "  --use-prev-frame-depth  Warm Hi-Z from prior frame clip.w buffer (see stderr hints at startup).\n"
+	    "  --gpu-draw-always       Reference/id pass draws full frustum (FN pixels); default draws "
+	    "only MOC-visible after queries.\n"
+	    "  --tonemap-depth         Make --save-depth-frame write 8-bit PNG instead of float PFM.\n"
+	    "\n"
+	    "Example:\n"
+	    "  %s model.glb --headless \\\n"
+	    "    --camera='((0,1.6,-5),(0,0,1),(0,1,0))' --near=0.05 --far=500 \\\n"
+	    "    --moc-test=aabb --max-frames=30\n",
+	    prog, prog);
+}
+
 int main(int argc, char **argv) {
 	bool headless = false;
 	bool perObjectReport = false;
@@ -1734,6 +1801,14 @@ int main(int argc, char **argv) {
 		}
 	}
 	for (int i = 1; i < argc; ++i) {
+		if (!std::strcmp(argv[i], "-h")) {
+			PrintAccBenchHelpShort(stdout, argc > 0 ? argv[0] : "AccuracyBench");
+			return 0;
+		}
+		if (!std::strcmp(argv[i], "--help")) {
+			PrintAccBenchHelpLong(stdout, argc > 0 ? argv[0] : "AccuracyBench");
+			return 0;
+		}
 		if (!std::strncmp(argv[i], "--moc-test=", 11)) {
 			const char *v = argv[i] + 11;
 			if (!ParseMocTestString(v, mocOccludeeTest, mocDopK)) {
