@@ -10,6 +10,12 @@ Failed runs not written; errors only on stderr.
 
   ./batch_accbench.py --bench ./build/Release/AccuracyBench \\
     --assets-base ../assets --out accbench_batch_results.csv
+
+  # Full frustum GPU id readback (gpuIds without MOC-culled submit):
+  ./batch_accbench.py --gpu-draw-always --out accbench_gpu_draw_always.csv
+
+  # Only selected bounds (CSV column `bound`: aabb, aabb-tri, dop10, …):
+  ./batch_accbench.py --bounds-filter=aabb,aabb-tri --dry-run
 """
 
 from __future__ import annotations
@@ -107,6 +113,32 @@ def camera_hash8(scene_id: str, camera: str) -> str:
     return hashlib.sha1(f"{scene_id}|{camera}".encode("utf-8")).hexdigest()[:8]
 
 
+def dop_k_to_moc_bound(dop_k: int) -> tuple[str, str]:
+    if dop_k == 0:
+        return "aabb", "aabb"
+    if dop_k == 1:
+        return "aabb-tri", "aabb-tri"
+    return f"dop{dop_k}tri", f"dop{dop_k}"
+
+
+def normalize_bound_token(token: str) -> str:
+    """Map filter token to CSV `bound` label (dop10tri -> dop10)."""
+    t = token.strip().lower()
+    m = re.fullmatch(r"dop(\d+)tri", t)
+    if m:
+        return f"dop{m.group(1)}"
+    return t
+
+
+def parse_bounds_filter(spec: str | None) -> set[str] | None:
+    if spec is None:
+        return None
+    tokens = [normalize_bound_token(p) for p in spec.split(",") if p.strip()]
+    if not tokens:
+        return None
+    return set(tokens)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bench", type=Path, default=Path("./build/Release/AccuracyBench"), help="AccuracyBench binary")
@@ -118,10 +150,22 @@ def main() -> int:
     )
     p.add_argument("--out", type=Path, default=Path("accbench_batch_results.csv"))
     p.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True, help="Pass --headless (default: on)")
+    p.add_argument(
+        "--gpu-draw-always",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass --gpu-draw-always: GPU reference draws full frustum (gpuIds without MOC-culled submit)",
+    )
     p.add_argument("--max-frames", type=int, default=30, help="Exit after N benchmark frames; last ACCBench used")
     p.add_argument("--dop-min", type=int, default=10)
     p.add_argument("--dop-max", type=int, default=30)
     p.add_argument("--dop-step", type=int, default=2, help="Step from min to max (even k: use step 2)")
+    p.add_argument(
+        "--bounds-filter",
+        metavar="LIST",
+        default=None,
+        help='Comma-separated bound labels to run (CSV `bound`: aabb, aabb-tri, dop10, …; dop10tri accepted)',
+    )
     p.add_argument("--timeout", type=float, default=None, help="Per-run subprocess timeout (seconds)")
     p.add_argument("--dry-run", action="store_true", help="Print commands only")
     args = p.parse_args()
@@ -132,6 +176,23 @@ def main() -> int:
         if k not in (0, 1):
             dop_ks.append(k)
         k += args.dop_step
+
+    bounds_filter = parse_bounds_filter(args.bounds_filter)
+    if bounds_filter is not None:
+        available = {dop_k_to_moc_bound(dop_k)[1] for dop_k in dop_ks}
+        unknown = sorted(bounds_filter - available)
+        if unknown:
+            avail = ", ".join(sorted(available))
+            unk = ", ".join(unknown)
+            print(
+                f"batch_accbench: --bounds-filter unknown bound(s): {unk} (available with current dop range: {avail})",
+                file=sys.stderr,
+            )
+            return 2
+        dop_ks = [dop_k for dop_k in dop_ks if dop_k_to_moc_bound(dop_k)[1] in bounds_filter]
+        if not dop_ks:
+            print("batch_accbench: --bounds-filter matched no bounds in dop range", file=sys.stderr)
+            return 2
 
     fieldnames = [
         "scene_name",
@@ -162,17 +223,14 @@ def main() -> int:
             for use_prev_frame_depth in (False, True):
                 mode_label = "without-prev-frame-depth" if not use_prev_frame_depth else "with-prev-frame-depth"
                 for dop_k in dop_ks:
-                    if dop_k == 0:
-                        moc, bound = "aabb", "aabb"
-                    elif dop_k == 1:
-                        moc, bound = "aabb-tri", "aabb-tri"
-                    else:
-                        moc, bound = f"dop{dop_k}tri", f"dop{dop_k}"
+                    moc, bound = dop_k_to_moc_bound(dop_k)
                     argv: list[str] = [str(args.bench)]
                     if args.headless:
                         argv.append("--headless")
                     if use_prev_frame_depth:
                         argv.append("--use-prev-frame-depth")
+                    if args.gpu_draw_always:
+                        argv.append("--gpu-draw-always")
                     argv.extend(
                         [
                             str(model),
